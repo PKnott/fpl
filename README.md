@@ -14,6 +14,30 @@ reference/                  frozen outputs the verification compares against
 _ref_current/               the pre-refactor code, kept only as a reference
 ```
 
+## Where things live
+
+The repo sits in iCloud Desktop, but three things do **not**. They are symlinked
+in from `~/FPL-work`:
+
+| | why it stays out of iCloud |
+|---|---|
+| `.venv` | iCloud evicts files it considers idle, which breaks Python binaries |
+| `bt_cache` | ~500MB of regenerable pickles and records |
+| `bt_data` | archive CSVs, re-downloadable any time |
+
+All three are gitignored, so the repo itself is about 20MB. To rebuild them on a
+fresh machine:
+
+```bash
+mkdir -p ~/FPL-work && cd ~/FPL-work
+python3 -m venv .venv
+.venv/bin/pip install pandas numpy pulp scipy requests
+cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Desktop/FPL"
+ln -s ~/FPL-work/.venv .venv
+ln -s ~/FPL-work/bt_cache bt_cache
+ln -s ~/FPL-work/bt_data bt_data
+```
+
 Both notebooks download `fpl_engine.py` from this repo, so what the backtest tunes
 is what runs on a Saturday. Previously each notebook carried its own copy; the
 bodies were identical but the settings had drifted (`PLAN_WEEKS` 5 vs 6,
