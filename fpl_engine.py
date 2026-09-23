@@ -565,11 +565,48 @@ def load_team(bs, cfg, next_gw, df):
     return squad, bank, sell, chips
 
 
+# ---------------------------------------------------------------------
+# 6b. FPL RULES
+# ---------------------------------------------------------------------
+# One home for the rules of the game. The planner expresses them as LP
+# constraints and the simulator has to apply them to real state; keeping the
+# statements here is what stops the two drifting apart, which is how the
+# backtest ended up testing something other than what runs on a Saturday.
+MAX_SAVED_FT = 5
+
+
 def chip_window(bs, chip, gw):
+    """Last gameweek of the window `chip` is in at `gw`, or None if it isn't in one."""
     for c in bs.get("chips", []):
         if c["name"] == chip and c["start_event"] <= gw <= c["stop_event"]:
             return c["stop_event"]
     return None if bs.get("chips") else 38
+
+
+def chips_left(bs, gw, used):
+    """Chips still available in the window containing `gw`.
+
+    `used` is a set of (chip, stop_event) pairs - a chip spent in the first half
+    comes back for the second, because FPL gives a fresh set per window.
+    """
+    out = []
+    for c in CHIP_NAMES:
+        stop = chip_window(bs, c, gw)
+        if stop is not None and (c, stop) not in used:
+            out.append(c)
+    return out
+
+
+def free_transfers_after(ft, n_transfers, hits, chip=None):
+    """Free transfers carried into next week.
+
+    You bank one a week up to MAX_SAVED_FT and always have at least one. Hits are
+    transfers bought with points, so they don't consume a free one. Wildcard and
+    Free Hit spend no free transfers at all, so the saved ones carry over intact.
+    """
+    if chip in ("wildcard", "freehit"):
+        return min(MAX_SAVED_FT, ft)
+    return min(MAX_SAVED_FT, max(1, ft - (n_transfers - hits) + 1))
 
 
 # ---------------------------------------------------------------------
@@ -847,7 +884,7 @@ def free_hit_squad(df, gw, budget, cfg):
 # ---------------------------------------------------------------------
 # 9. CHIP TIMING
 # ---------------------------------------------------------------------
-def chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg, fx_map, unscheduled, pool):
+def chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg, pool):
     g0 = gws[0]
     squad_at = {w["gw"]: w["squad"] for w in plan["weeks"]}
     last_squad = plan["weeks"][-1]["squad"]
@@ -948,6 +985,82 @@ def chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg, fx_map, unsche
                 results[c] = (False, r[1], f"save - {CHIP_NAMES[keep]} is worth more this week.",
                               *r[3:])
     return results
+
+
+# ---------------------------------------------------------------------
+# 9c. THE WEEKLY DECISION
+# ---------------------------------------------------------------------
+@dataclass
+class Decision:
+    """One gameweek's decision, whoever is asking.
+
+    The live report prints this; the backtest applies it and scores what really
+    happened. Both get here the same way - previously each had its own copy of
+    the sequence and they had already diverged on how the XI was picked.
+    """
+    plans: dict          # transfers made this week -> best multi-week plan starting that way
+    best_n: int          # the number of transfers that scored highest
+    plan: dict           # the plan being followed (the wildcard plan, if one is played)
+    advice: dict         # chip -> chip_advice result
+    chip: str = None     # chip being played this week, if any
+    squad: list = None   # the 15 to field this week (a Free Hit squad if that chip is on)
+    ins: list = field(default_factory=list)
+    outs: list = field(default_factory=list)
+    hits: int = 0
+    bank: float = 0.0    # bank after this week's moves
+    keep_squad: bool = False   # Free Hit: this week's squad is borrowed, don't keep it
+
+    @property
+    def n_transfers(self):
+        return len(self.ins)
+
+
+def choose_transfers(proj, gws, squad, bank, sell, cfg, pool=None):
+    """Best multi-week plan for every possible number of transfers this week.
+
+    Returns (plans, best_n, pool). Solving each `n_first` separately is what lets
+    the report show "0 transfers vs 1 vs 2" as real alternatives rather than one
+    answer; the decision just takes the best objective.
+    """
+    if pool is None:
+        pool, _ = solver_pool(proj.df, squad, cfg)
+    plans = {}
+    for n in range(0, cfg["MAX_TRANSFERS"] + 1):
+        p = plan_transfers(proj.df, gws, squad, bank, sell, cfg, n_first=n, pool=pool)
+        if p:
+            plans[n] = p
+    if not plans:
+        raise RuntimeError("the transfer planner found no feasible plan")
+    return plans, max(plans, key=lambda n: plans[n]["objective"]), pool
+
+
+def decide_week(proj, gws, bs, squad, bank, sell, cfg, chips=()):
+    """Plan this week's transfers, then decide whether a chip beats them."""
+    df = proj.df
+    plans, best_n, pool = choose_transfers(proj, gws, squad, bank, sell, cfg)
+    plan = plans[best_n]
+    advice = chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg, pool) if chips else {}
+    chip = next((c for c, r in advice.items() if r[0]), None)
+
+    d = Decision(plans=plans, best_n=best_n, plan=plan, advice=advice, bank=bank)
+
+    if chip == "freehit" and advice["freehit"][3]:
+        # A borrowed squad for one week: no permanent moves, so the real squad,
+        # the bank and the saved free transfers are all untouched.
+        d.chip, d.squad, d.keep_squad = "freehit", advice["freehit"][3], False
+        return d
+
+    if chip == "wildcard" and advice["wildcard"][3]:
+        d.chip, d.plan = "wildcard", advice["wildcard"][3]
+        wk = d.plan["weeks"][0]
+        d.hits = 0                          # unlimited free transfers
+    else:
+        wk = plan["weeks"][0]
+        d.hits = wk["hits"]
+        d.chip = chip if chip in ("3xc", "bboost") else None
+    d.ins, d.outs, d.squad, d.keep_squad = wk["in"], wk["out"], wk["squad"], True
+    d.bank = wk["bank"]
+    return d
 
 
 # ---------------------------------------------------------------------
@@ -1119,19 +1232,10 @@ def run(cfg=None, data=None, past=None):
             print(f"{POS[p] + ' ' + df.loc[i, 'name']:<24}{sell[i]:>6.1f}{df.loc[i, 'xp_next']:>6.1f}"
                   f"{df.loc[i, 'xp_long']:>7.1f}  {fixture_str(df.loc[i, 'team_id'], g0)}{price}{news}")
 
-    # ---- plan transfers (all options), then time chips against the best plan
-    pool, _ = solver_pool(df, squad, cfg)
-    plans = {}
-    for n in range(0, cfg["MAX_TRANSFERS"] + 1):
-        p = plan_transfers(df, gws, squad, bank, sell, cfg, n_first=n, pool=pool)
-        if p:
-            plans[n] = p
-    best_n = max(plans, key=lambda n: plans[n]["objective"])
-    plan = plans[best_n]
-    w0 = plan["weeks"][0]
-    advice = chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg,
-                         fx_map, unscheduled, pool) if chips else {}
-    active = next((c for c, r in advice.items() if r[0]), None)
+    # ---- the decision (the same call the backtest makes)
+    d = decide_week(proj, gws, bs, squad, bank, sell, cfg, chips)
+    plans, best_n, plan, advice, active = d.plans, d.best_n, d.plan, d.advice, d.chip
+    w0 = plans[best_n]["weeks"][0]
 
     # ---- chips
     print(f"\n{L}\n CHIPS  (compared across every week of each chip's window)\n{L}")
@@ -1147,18 +1251,13 @@ def run(cfg=None, data=None, past=None):
 
     # ---- transfers
     print(f"\n{L}\n TRANSFERS\n{L}")
-    lineup_squad = w0["squad"]
-    if active == "wildcard" and advice["wildcard"][3]:
-        wp = advice["wildcard"][3]
-        wk = wp["weeks"][0]
-        lineup_squad = wk["squad"]
+    lineup_squad = d.squad
+    if active == "wildcard":
         print(f">>> PLAY WILDCARD - make these moves (no hits):")
-        for o, i in pair_moves(df, wk["out"], wk["in"]):
+        for o, i in pair_moves(df, d.outs, d.ins):
             print(f"   OUT {nm(o):<32} IN {nm(i)}")
-        print(f"   Bank after: £{wk['bank']:.1f}m")
-        plan = wp
-    elif active == "freehit" and advice["freehit"][3]:
-        lineup_squad = advice["freehit"][3]
+        print(f"   Bank after: £{d.bank:.1f}m")
+    elif active == "freehit":
         print(">>> PLAY FREE HIT - pick this one-week squad (your team returns next week):")
         for p_ in POS:
             print(f"   {POS[p_]}: " + ", ".join(nm(i) for i in lineup_squad

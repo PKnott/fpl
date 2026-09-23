@@ -105,13 +105,29 @@ def main():
     if proj_only:
         sys.exit(0 if proj_ok else 1)
 
-    print("\nFULL-SEASON SIM (must be identical)")
-    import sim
     want = manifest["sim"]
-    t0 = time.time()
-    got = sim.simulate(ref_cfg, label=want["label"], start=list(sim.initial_squad()),
-                       last_gw=want["last_gw"])
-    secs = time.time() - t0
+    if "--new-backtest" in sys.argv:
+        # Step 3 onwards: the rewritten harness, which calls E.decide_week instead
+        # of restating the weekly decision. Same engine, same config, same answer.
+        print("\nFULL-SEASON SIM via fpl_backtest.simulate (must be identical)")
+        os.environ["BT_DATA"] = str(ROOT / "bt_data")
+        os.environ["BT_CACHE"] = str(ROOT / "bt_cache")
+        sys.path.insert(0, str(ROOT))
+        import fpl_backtest as B
+        source = B.ArchiveSource("2025-26")
+        projector = B.Projector(source, ref_cfg, manifest["max_view"])
+        t0 = time.time()
+        got = B.simulate(projector, ref_cfg, label=want["label"],
+                         start=list(B.initial_squad(projector, ref_cfg)),
+                         last_gw=want["last_gw"])
+        secs = time.time() - t0
+    else:
+        print("\nFULL-SEASON SIM via the original harness (must be identical)")
+        import sim
+        t0 = time.time()
+        got = sim.simulate(ref_cfg, label=want["label"], start=list(sim.initial_squad()),
+                           last_gw=want["last_gw"])
+        secs = time.time() - t0
 
     log_match = [tuple(x) for x in got["log"]] == [tuple(x) for x in want["log"]]
     rows = [("total", want["total"], got["total"]),
