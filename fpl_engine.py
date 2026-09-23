@@ -344,7 +344,11 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
     dc_pts = sc.get("defensive_contribution", {"GKP": 0, "DEF": 2, "MID": 2, "FWD": 2})
     ast_pts = sc.get("assists", 3)
     w = cfg["XG_WEIGHT"]
-    gws = list(range(next_gw, min(next_gw + cfg["LONG_VIEW"], 39)))
+    # Project as far as PROJECTION_WEEKS; the planner is handed a LONG_VIEW slice
+    # of this and chips read the whole thing. Defaults to LONG_VIEW so a config
+    # predating the split behaves exactly as it used to.
+    horizon = cfg.get("PROJECTION_WEEKS") or cfg["LONG_VIEW"]
+    gws = list(range(next_gw, min(next_gw + horizon, 39)))
 
     fx_map = {}
     for fx in fixtures:
@@ -489,7 +493,10 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
                      **{f"gw{g}": xp[g] for g in gws}})
     df = pd.DataFrame(rows).set_index("id")
     df["xp_next"] = df[f"gw{gws[0]}"]
-    df["xp_long"] = sum(df[f"gw{g}"] * cfg["DECAY"] ** i for i, g in enumerate(gws))
+    # Long-term value is a planning quantity, so it spans LONG_VIEW, not the whole
+    # projection horizon.
+    df["xp_long"] = sum(df[f"gw{g}"] * cfg["DECAY"] ** i
+                        for i, g in enumerate(gws[:cfg["LONG_VIEW"]]))
     unscheduled = [fx for fx in fixtures if fx.get("event") is None]
     return Projections(df, gws, ts, fx_map, unscheduled, breakdown)
 
@@ -1356,14 +1363,17 @@ def run(cfg=None, data=None, past=None):
         proj = build_projections(bs, fixtures, cfg, next_gw, past)
 
     df, gws, ts, fx_map, unscheduled = proj
-    g0 = gws[0]
+    # The planner sees LONG_VIEW weeks; chips read the full horizon off `proj`.
+    # The backtest splits these the same way, so the two cannot drift.
+    plan_gws = gws[:cfg["LONG_VIEW"]]
+    g0 = plan_gws[0]
     nm = lambda i: f"{df.loc[i, 'name']} ({df.loc[i, 'team']}, £{df.loc[i, 'price']:.1f}m)"
     L = "=" * 62
     fixture_str = proj.fixture_str
 
     print(L)
     print(f" FPL ASSISTANT - GW{g0}   plan GW{g0}-{g0 + cfg['PLAN_WEEKS'] - 1}, "
-          f"long view to GW{gws[-1]}")
+          f"long view to GW{plan_gws[-1]}, projections to GW{gws[-1]}")
     print(L)
     print(f"Bank £{bank:.1f}m | Free transfers {cfg['FREE_TRANSFERS']} | "
           f"Chips: {', '.join(CHIP_NAMES[c] for c in chips) or 'none'}\n")
@@ -1380,7 +1390,7 @@ def run(cfg=None, data=None, past=None):
                   f"{df.loc[i, 'xp_long']:>7.1f}  {fixture_str(df.loc[i, 'team_id'], g0)}{price}{news}")
 
     # ---- the decision (the same call the backtest makes)
-    d = decide_week(proj, gws, bs, squad, bank, sell, cfg, chips)
+    d = decide_week(proj, plan_gws, bs, squad, bank, sell, cfg, chips)
     plans, best_n, plan, advice, active = d.plans, d.best_n, d.plan, d.advice, d.chip
     w0 = plans[best_n]["weeks"][0]
 
@@ -1459,7 +1469,7 @@ def run(cfg=None, data=None, past=None):
     print("  Starters are picked on points IF they play - the bench covers anyone who gets 0 minutes.")
 
     # ---- value table
-    print(f"\n{L}\n VALUE vs POSITION AVERAGE  (projected pts per £m, {len(gws)} weeks)\n{L}")
+    print(f"\n{L}\n VALUE vs POSITION AVERAGE  (projected pts per £m, {len(plan_gws)} weeks)\n{L}")
     df["value"] = df["xp_long"] / df["price"]
     reg = df[(df["minutes"] >= 180) & (df["status"] != "u")]
     avg = reg.groupby("pos")["value"].mean()

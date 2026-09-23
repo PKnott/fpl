@@ -184,7 +184,7 @@ class Projector:
 
     def __init__(self, source, proj_cfg, weeks):
         self.source = source
-        self.cfg = dict(proj_cfg, LONG_VIEW=weeks)
+        self.cfg = dict(proj_cfg, PROJECTION_WEEKS=weeks)
         self.weeks = weeks
         CACHE.mkdir(parents=True, exist_ok=True)
         key = cache_key({"season": source.season, "weeks": weeks, "cfg": self.cfg})
@@ -287,7 +287,13 @@ def record_week(source, proj, bs, pos, chips, forecast, squad, lu, gw_pts, t, cf
     mins = lambda i: source.minutes.get((i, t), 0)
     pts = lambda i: source.actual.get((i, t), 0)
     out = {}
+    # Only the replayable chips. The wildcard changes the squad trajectory, so its
+    # payoff can't be recovered from a table and is priced by full simulation
+    # instead - and valuing it costs a whole multi-week planner solve per candidate
+    # week, which dominated the recording cost for a column of None.
     for c in chips:
+        if c == "wildcard":
+            continue
         stop = E.chip_window(bs, c, t)
         if stop is None:
             continue
@@ -308,8 +314,8 @@ def record_week(source, proj, bs, pos, chips, forecast, squad, lu, gw_pts, t, cf
             fl = lineup(proj, fh, t, cfg)
             actual = actual_score(source, pos, fh, fl["xi"], fl["cap"], fl["vice"],
                                   fl["bench"], t, None) - gw_pts
-        else:                                           # wildcard: changes the squad
-            actual = None                               # only full sims can price it
+        else:
+            continue
         out[c] = {"values": {int(g): round(float(v), 3) for g, v in values.items()},
                   "stop": int(stop), "actual": actual}
     return out

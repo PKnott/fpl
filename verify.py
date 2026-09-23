@@ -1,5 +1,12 @@
 """Prove the refactored engine behaves exactly like the code it replaced.
 
+NOTE: the full-season sim comparison is meaningful only up to step 3, the last
+point at which behaviour was required to be identical. Step 4 changed the lineup
+on purpose (2022 -> 2030) and step 6 replaced the chip rules, so the sim check
+will differ from the reference after those. `--projections-only` stays valid
+throughout and is the part to keep running: the projection model itself has not
+changed and must not.
+
 The comparison holds everything else still: it runs the ORIGINAL backtest harness
 (_ref_current/sim.py, unmodified except for the import line) against the NEW
 fpl_engine, using reference/ref_cfg.json so no setting falls through to a default.
