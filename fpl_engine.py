@@ -781,34 +781,40 @@ def pick_lineup(proj, squad, gw, sims=4000, seed=1):
     vals = np.array([v[i] for i in squad])
 
     def score(xi, bench, cap, vice):
-        xi_k = [idx[i] for i in xi]
+        """Expected points for this XI, bench order and armband, over all draws at once.
+
+        Every quantity below is a vector over the simulation axis, so the autosub
+        rules are applied to all `sims` draws in a handful of array operations
+        rather than a Python loop per draw.
+        """
+        xi_k = np.fromiter((idx[i] for i in xi), int, len(xi))
         bench_k = [idx[i] for i in bench]
-        total = np.zeros(sims)
-        for s_ in range(sims):
-            pl = plays[s_]
-            on = [k for k in xi_k if pl[k]]
-            count = {q: sum(1 for k in on if pos[squad[k]] == q) for q in POS}
-            missing = [k for k in xi_k if not pl[k]]
-            n_missing_out = sum(1 for k in missing if pos[squad[k]] != 1)
-            # goalkeeper autosub
-            if any(pos[squad[k]] == 1 for k in missing):
-                gk_b = bench_k[0]
-                if pl[gk_b]:
-                    on.append(gk_b)
-            # outfield autosubs in bench order, respecting formation minimums
-            for b in bench_k[1:]:
-                if n_missing_out == 0:
-                    break
-                if not pl[b]:
-                    continue
-                q = pos[squad[b]]
-                need = {r: max(0, MIN_IN_XI[r] - count[r]) for r in (2, 3, 4)}
-                spare = n_missing_out - sum(need.values())
-                if need.get(q, 0) > 0 or spare > 0:
-                    on.append(b); count[q] += 1; n_missing_out -= 1
-            pts = vals[on].sum()
-            c = idx[cap] if pl[idx[cap]] else (idx[vice] if pl[idx[vice]] else None)
-            total[s_] = pts + (vals[c] if c is not None else 0)
+        xi_pos = np.fromiter((pos[squad[k]] for k in xi_k), int, len(xi_k))
+        pl = plays[:, xi_k]                              # (sims, 11) who turned out
+
+        total = (pl * vals[xi_k]).sum(1)
+        count = {q: (pl & (xi_pos == q)).sum(1) for q in POS}
+        missing_gk = (~pl & (xi_pos == 1)).any(1)
+        n_missing_out = (~pl & (xi_pos != 1)).sum(1)
+
+        gk_b = bench_k[0]                                # goalkeeper autosub
+        total = total + (missing_gk & plays[:, gk_b]) * vals[gk_b]
+
+        for b in bench_k[1:]:                            # outfield, in bench order
+            q = pos[squad[b]]
+            need_q = np.maximum(0, MIN_IN_XI[q] - count[q])
+            need_all = sum(np.maximum(0, MIN_IN_XI[r] - count[r]) for r in (2, 3, 4))
+            # Come on if you fill a shortfall, or if there is room spare once every
+            # formation minimum is covered.
+            take = (plays[:, b] & (n_missing_out > 0)
+                    & ((need_q > 0) | (n_missing_out - need_all > 0)))
+            total = total + take * vals[b]
+            count[q] = count[q] + take
+            n_missing_out = n_missing_out - take
+
+        cap_k, vice_k = idx[cap], idx[vice]               # vice takes over if needed
+        total = total + np.where(plays[:, cap_k], vals[cap_k],
+                                 np.where(plays[:, vice_k], vals[vice_k], 0.0))
         return total.mean()
 
     def bench_for(xi):

@@ -238,6 +238,19 @@ def actual_score(source, pos, squad, xi, cap, vice, bench, t, chip):
 # ---------------------------------------------------------------------
 # The simulation
 # ---------------------------------------------------------------------
+def lineup(proj, squad, t, cfg):
+    """Pick the XI the way the live report does.
+
+    Set LINEUP="best_xi" to fall back to the old deterministic pick, which ignores
+    each player's chance of playing. That is what the backtest used to do at every
+    call site while the live report used pick_lineup, so the lineup logic that
+    actually runs on a Saturday was never tested. Kept only for before/after work.
+    """
+    if cfg.get("LINEUP") == "best_xi":
+        return E.best_xi(proj.df, squad, t)
+    return E.pick_lineup(proj, squad, t)
+
+
 def initial_squad(projector, cfg):
     """GW1 opening squad: the best £100.0m 15 on long-term projected points."""
     base, _ = projector.data[1]
@@ -273,7 +286,7 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
         pos = df["pos"]
 
         if t == 1:                                    # opening squad, no transfers
-            lu = E.best_xi(df, squad, t)
+            lu = lineup(proj, squad, t, cfg)
             total += actual_score(source, pos, squad, lu["xi"], lu["cap"], lu["vice"],
                                   lu["bench"], t, None)
             continue
@@ -289,7 +302,7 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
 
         if chip == "freehit":
             # A borrowed squad: score it, then hand the real one back untouched.
-            lu = E.best_xi(df, d.squad, t)
+            lu = lineup(proj, d.squad, t, cfg)
             total += actual_score(source, pos, d.squad, lu["xi"], lu["cap"], lu["vice"],
                                   lu["bench"], t, None)
             ft = E.free_transfers_after(ft, 0, 0, chip="freehit")
@@ -306,7 +319,7 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
         squad = d.squad
         ft = E.free_transfers_after(ft, len(d.ins), d.hits, chip=chip)
 
-        lu = E.best_xi(df, squad, t)
+        lu = lineup(proj, squad, t, cfg)
         gw_pts = actual_score(source, pos, squad, lu["xi"], lu["cap"], lu["vice"],
                               lu["bench"], t, chip)
         total += gw_pts - cfg["HIT_COST_REAL"] * d.hits
