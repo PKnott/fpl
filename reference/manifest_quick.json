@@ -1,0 +1,91 @@
+{
+  "config": "ref_cfg.json",
+  "max_view": 18,
+  "projections": {
+    "2": {
+      "file": "proj_gw2.csv",
+      "rows": 705,
+      "sha256_16": "45cba874cdd96457",
+      "gws": [
+        2,
+        19
+      ]
+    },
+    "10": {
+      "file": "proj_gw10.csv",
+      "rows": 747,
+      "sha256_16": "121f3a23db456994",
+      "gws": [
+        10,
+        27
+      ]
+    },
+    "20": {
+      "file": "proj_gw20.csv",
+      "rows": 790,
+      "sha256_16": "3a74b9e29bd5607f",
+      "gws": [
+        20,
+        37
+      ]
+    },
+    "30": {
+      "file": "proj_gw30.csv",
+      "rows": 822,
+      "sha256_16": "93220fa436c8f015",
+      "gws": [
+        30,
+        38
+      ]
+    },
+    "38": {
+      "file": "proj_gw38.csv",
+      "rows": 841,
+      "sha256_16": "3f8674e154446931",
+      "gws": [
+        38,
+        38
+      ]
+    }
+  },
+  "sim": {
+    "label": "hit6 decay0.8",
+    "last_gw": 6,
+    "total": "307",
+    "transfers": 17,
+    "hits": 0,
+    "chips": "Triple Captain GW3, FREE HIT GW6, Wildcard GW2",
+    "log": [
+      [
+        2,
+        "wildcard",
+        14,
+        0
+      ],
+      [
+        3,
+        "3xc",
+        1,
+        0
+      ],
+      [
+        4,
+        "",
+        1,
+        0
+      ],
+      [
+        5,
+        "",
+        1,
+        0
+      ],
+      [
+        6,
+        "FREE HIT",
+        0
+      ]
+    ],
+    "secs": 36.2
+  }
+}

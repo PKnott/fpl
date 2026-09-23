@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+bt_data/
+bt_cache/
+*.pkl
+proj_cache_*
+.ipynb_checkpoints/
+.DS_Store
+reference/make_reference.log
+_ref_current/bt_data
