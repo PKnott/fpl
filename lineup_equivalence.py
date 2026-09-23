@@ -42,7 +42,7 @@ def main():
     t_old = t_new = 0.0
     for n in range(n_samples):
         gw = rng.randint(2, 38)
-        proj, bs = projector.week(gw, max_view, ref_cfg["DECAY"])
+        proj, bs, _ = projector.week(gw, max_view, ref_cfg["DECAY"])
         # Perturb the squad so we are not measuring the same 15 every time, while
         # keeping it legal: swap a few players for others in the same position.
         squad = list(base_squad)

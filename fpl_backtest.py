@@ -195,13 +195,20 @@ class Projector:
         return out
 
     def week(self, t, view, decay):
-        """This week's projections re-weighted for one run's LONG_VIEW and DECAY."""
+        """This week's projections, with long-term value re-weighted for one run.
+
+        The returned Projections keeps the FULL projection horizon, because chips
+        look further ahead than the planner: valuing a wildcard near the end of a
+        window needs weeks the planner's LONG_VIEW slice does not contain. The
+        planner is handed `gws[:view]` separately.
+        """
         base, bs = self.data[t]
         df = base.df.copy()
-        gws = base.gws[:view]
-        df["xp_long"] = sum(df[f"gw{g}"] * decay ** i for i, g in enumerate(gws))
-        proj = E.Projections(df, gws, base.ts, base.fx_map, base.unscheduled, base.explain)
-        return proj, bs
+        plan_gws = base.gws[:view]
+        df["xp_long"] = sum(df[f"gw{g}"] * decay ** i for i, g in enumerate(plan_gws))
+        proj = E.Projections(df, base.gws, base.ts, base.fx_map, base.unscheduled,
+                             base.explain)
+        return proj, bs, plan_gws
 
 
 # ---------------------------------------------------------------------
@@ -279,9 +286,13 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
     purchase = {i: projector.data[1][0].df.loc[i, "price"] for i in squad}
     bank = round(100.0 - sum(purchase.values()), 1)
     ft, used, total, hits_total, log = 1, set(), 0, 0, []
+    # Best one-week squads depend only on (gameweek, budget), so they are shared
+    # across every week of the season rather than re-solved for each.
+    fh_cache = {}
+    chip_tables = {}
 
     for t in range(1, last_gw + 1):
-        proj, bs = projector.week(t, view, cfg["DECAY"])
+        proj, bs, plan_gws = projector.week(t, view, cfg["DECAY"])
         df = proj.df
         pos = df["pos"]
 
@@ -295,8 +306,15 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
         chips = E.chips_left(bs, t, used) if cfg.get("USE_CHIPS", True) else []
         cfg["FREE_TRANSFERS"] = ft
 
-        d = E.decide_week(proj, proj.gws, bs, squad, bank, sell, cfg, chips)
+        d = E.decide_week(proj, plan_gws, bs, squad, bank, sell, cfg, chips,
+                          fh_cache=fh_cache)
         chip = d.chip
+        if d.advice:
+            # Keep every chip's opportunity table: tuning the top-x% rule later
+            # replays these instead of re-running the season for each value.
+            chip_tables[t] = {c: {"values": dict(v["values"]), "rank": v["rank"],
+                                  "n": v["n"], "played": c == chip}
+                              for c, v in d.advice.items()}
         if chip:
             used.add((chip, E.chip_window(bs, chip, t)))
 
@@ -336,7 +354,7 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
                           for c, w in sorted(chip_weeks.items()))
     return {"label": label, "total": total, "hits": hits_total,
             "transfers": sum(l[2] for l in log if len(l) > 3),
-            "chips": chips_txt, "log": log}
+            "chips": chips_txt, "log": log, "chip_tables": chip_tables}
 
 
 def run_grid(projector, runs, base_cfg, results_file, last_gw=38):

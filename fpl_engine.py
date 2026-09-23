@@ -70,6 +70,14 @@ DEFAULTS = {
     "SKIP_BEFORE_DEBUT": False,
 
     # ---- planning ----
+    # Three different horizons, previously conflated into one:
+    #   PLAN_WEEKS        weeks of transfers solved together
+    #   LONG_VIEW         weeks used for a squad's long-term value (the tail)
+    #   PROJECTION_WEEKS  how far points are projected at all. Chips need more than
+    #                     LONG_VIEW: valuing a wildcard at GW19 over WC_VALUE_WEEKS=6
+    #                     needs GW25, which is 24 weeks out from GW2. A chip's own
+    #                     horizon comes from its expiry, not from any of these.
+    "PROJECTION_WEEKS": 24,
     "PLAN_WEEKS": 5,                # weeks of transfers planned together
     "LONG_VIEW": 19,                # weeks of projections used for long-term value
     "DECAY": 0.8,                   # later weeks count a bit less (uncertainty)
@@ -111,16 +119,16 @@ DEFAULTS = {
     "POINTS_PER_TENTH": 0.5,        # value of £0.1m team value, in points
 
     # ---- chips ----
-    "CHIP_RATIO": 0.85,             # play if this week is at least this share of the best
-    "CHIP_WAIT_DECAY": 0.98,        # each week of waiting counts this much less
-    "CHIP_IGNORE_MIN_IF_VISIBLE": True,
-    "WILDCARD_THRESHOLD": 15,
-    "FREEHIT_THRESHOLD": 12,
-    "BBOOST_MIN": 10,
-    "TC_MIN": 9,
+    # Play a chip when this week ranks in the top share of the weeks left in its
+    # window. The bar tightens on its own as the window runs out and reaches
+    # certainty in the last week, so no absolute point minimums are needed.
+    # Backtest-tuned per chip.
+    "CHIP_TOP_PCT": {"3xc": 0.15, "bboost": 0.15, "freehit": 0.15, "wildcard": 0.15},
 
     # ---- solver ----
     "SOLVER_SECONDS": 60,           # time limit per optimisation
+    "PATH_SOLVER_SECONDS": 5,       # ...per week of the squad forecast (many solves)
+    "FORECAST_POOL_PER_POS": 20,    # smaller player pool keeps the forecast quick
 }
 
 # What you edit each week.
@@ -849,8 +857,11 @@ def pick_lineup(proj, squad, gw, sims=4000, seed=1):
     best_cv = max(((score(xi, bench, c, vc), c, vc) for c in top for vc in top if vc != c),
                   key=lambda t: t[0])
     exp_total, cap, vice = best_cv
+    # Expected points from one armband: the captain if he plays, else the vice.
+    # This is exactly what a Triple Captain adds on top.
+    arm_xp = p[cap] * v[cap] + (1 - p[cap]) * p[vice] * v[vice]
     return {"xi": xi, "cap": cap, "vice": vice, "bench": bench, "total": exp_total,
-            "if_plays": v, "play_chance": p,
+            "if_plays": v, "play_chance": p, "arm_xp": arm_xp,
             "pts": sum(df.loc[i, col] for i in xi), "cap_xp": df.loc[cap, col],
             "bench_pts": sum(df.loc[i, col] for i in bench)}
 
@@ -888,109 +899,230 @@ def free_hit_squad(df, gw, budget, cfg):
 
 
 # ---------------------------------------------------------------------
+# 8b. SQUAD FORECAST
+# ---------------------------------------------------------------------
+def forecast_squads(proj, squad, bank, sell, cfg, until, plan_gws=None, pool_per_pos=None):
+    """The squad you would plausibly own in each week from now to `until`.
+
+    Steps forward one week at a time: run the ordinary planner from the forecast
+    state, keep only its first week's moves, then move on. That is what you would
+    actually do on each of those deadlines.
+
+    Chips need this because a chip is worth what it adds to the team you will have
+    when you play it. The old code valued every future week against
+    `plan["weeks"][-1]["squad"]` - the squad frozen at the end of the 5-week plan -
+    so a GW30 Bench Boost was priced against a GW6 bench.
+
+    Returns {gw: {"squad", "bank", "sell", "budget"}} for the state after that
+    week's moves. Assumes no chips are played later; if a Wildcard is played now,
+    rebuild this from the Wildcard squad.
+    """
+    df, gws = proj.df, proj.gws
+    horizon = [g for g in gws if g <= until]
+    # How many weeks ahead the planner looks at each future deadline. Chips see
+    # further than the planner does, so this is not simply len(proj.gws).
+    view_len = len(plan_gws) if plan_gws else len(gws)
+    cfg = dict(cfg)
+    cfg["SOLVER_SECONDS"] = cfg.get("PATH_SOLVER_SECONDS", 5)
+    per_pos = pool_per_pos or cfg.get("FORECAST_POOL_PER_POS", 20)
+
+    out, cur, cur_bank, cur_sell = {}, list(squad), bank, dict(sell)
+    ft = cfg.get("FREE_TRANSFERS", 1)
+    for k, g in enumerate(horizon):
+        remaining = [w for w in gws if w >= g][:view_len]   # what week g would see
+        # State as it stands on week g's deadline, before that week's moves. The
+        # wildcard is valued from here, because playing it replaces those moves.
+        before = {"squad": list(cur), "bank": cur_bank, "sell": dict(cur_sell),
+                  "ft": ft, "remaining": remaining}
+        objective = None
+        if len(remaining) >= 2:
+            cfg["FREE_TRANSFERS"] = ft
+            pool, _ = solver_pool(df, cur, cfg, per_pos=per_pos)
+            p = plan_transfers(df, remaining, cur, cur_bank, cur_sell, cfg, pool=pool)
+            if p:                              # infeasible: hold what we have
+                objective = p["objective"]
+                wk = p["weeks"][0]
+                for i in wk["in"]:
+                    # No price movement is modelled ahead, so a player bought
+                    # later sells for what he cost.
+                    cur_sell[i] = df.loc[i, "price"]
+                for o in wk["out"]:
+                    cur_sell.pop(o, None)
+                cur, cur_bank = wk["squad"], wk["bank"]
+                ft = free_transfers_after(ft, len(wk["in"]), wk["hits"])
+        out[g] = {"squad": list(cur), "bank": cur_bank, "sell": dict(cur_sell),
+                  "budget": cur_bank + sum(cur_sell.get(i, df.loc[i, "price"]) for i in cur),
+                  "before": before, "objective": objective}
+        if len(remaining) < 2:
+            break
+    return out
+
+
+def forecast_horizon(bs, gws, chips):
+    """Last week worth forecasting to: the latest expiry among unused chips."""
+    stops = [chip_window(bs, c, gws[0]) for c in chips]
+    stops = [s for s in stops if s]
+    return min(max(stops), gws[-1]) if stops else gws[0]
+
+
+# ---------------------------------------------------------------------
 # 9. CHIP TIMING
 # ---------------------------------------------------------------------
-def chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg, pool):
+# A chip is worth nothing unused, so the question is never "is this week good?"
+# but "is this week good enough, given how many chances are left?". Each chip is
+# valued the same way in every remaining week of its window, this week is ranked
+# among them, and it is played if it lands in the top x% - a bar that tightens
+# automatically as the window runs out, and reaches "play it" in the last week.
+#
+# This replaces CHIP_RATIO, CHIP_WAIT_DECAY, CHIP_IGNORE_MIN_IF_VISIBLE and four
+# absolute minimums (WILDCARD_THRESHOLD, FREEHIT_THRESHOLD, BBOOST_MIN, TC_MIN),
+# which between them tried to express the same idea with fixed point thresholds
+# that could not know how much season was left.
+
+
+
+
+def chip_value(chip, g, proj, state, cfg, fh_cache=None):
+    """What `chip` would be worth if played in gameweek `g`.
+
+    `state` is one week of `forecast_squads`, so every week is measured against
+    the squad you would actually own then. Each chip is in its own units; they are
+    never compared with each other, only with the same chip in other weeks.
+    """
+    df, gws = proj.df, proj.gws
+    squad, budget = state["squad"], state["budget"]
+
+    if chip == "3xc":
+        # The extra armband, allowing for the captain not playing and the vice
+        # taking over.
+        return pick_lineup(proj, squad, g)["arm_xp"]
+
+    if chip == "bboost":
+        return pick_lineup(proj, squad, g)["bench_pts"]
+
+    if chip == "freehit":
+        # Best one-week team money can buy, against the team you would have had.
+        key = (g, round(budget, 1))
+        if fh_cache is not None and key in fh_cache:
+            fh_pts = fh_cache[key][1]
+        else:
+            fh_squad, fh_pts = free_hit_squad(df, g, budget, cfg)
+            if fh_cache is not None:
+                fh_cache[key] = (fh_squad, fh_pts)
+        return fh_pts - best_xi(df, squad, g)["total"]
+
+    if chip == "wildcard":
+        # What a free rebuild is worth from here on: the planner's multi-week
+        # objective with unlimited transfers this week, minus the same objective
+        # without. Both are measured from the same state on week g's deadline and
+        # over the same weeks, so weeks can be ranked against each other.
+        #
+        # Not "best possible 15 minus the squad you'd have" - that gap shrinks every
+        # week, because the forecast assumes you keep transferring towards the same
+        # optimum, so it would rank the first week of the window best every time and
+        # the chip would always be played immediately.
+        before, baseline = state["before"], state["objective"]
+        if baseline is None:
+            return 0.0
+        wcfg = dict(cfg, FREE_TRANSFERS=before["ft"],
+                    SOLVER_SECONDS=cfg.get("PATH_SOLVER_SECONDS", 5))
+        pool, _ = solver_pool(df, before["squad"], wcfg,
+                              per_pos=cfg.get("FORECAST_POOL_PER_POS", 20))
+        p = plan_transfers(df, before["remaining"], before["squad"], before["bank"],
+                           before["sell"], wcfg, wc_week=0, pool=pool)
+        return (p["objective"] - baseline) if p else 0.0
+
+    raise ValueError(f"unknown chip {chip!r}")
+
+
+def rank_verdict(values, g0, stop, x):
+    """Rank this week among the remaining ones and decide.
+
+    Play if this week is in the top `x` share of what is left, always play in the
+    window's last week, and never play a chip worth nothing.
+    """
+    weeks = sorted(values)
+    n = len(weeks)
+    rank = 1 + sum(1 for g in weeks if values[g] > values[g0])
+    cutoff = max(1, math.ceil(x * n))
+    last_chance = (g0 == stop) or n == 1
+    play = bool(values[g0] > 0) and (rank <= cutoff or last_chance)
+    later = [values[g] for g in weeks if g > g0]
+    # What playing now costs you if a better week was coming. Infinite when there
+    # is no later week, so a last-chance chip always wins a clash.
+    regret = (values[g0] - max(later)) if later else float("inf")
+    return {"play": play, "rank": rank, "n": n, "cutoff": cutoff, "now": values[g0],
+            "best_gw": max(weeks, key=lambda g: values[g]), "values": values,
+            "regret": regret, "last_chance": last_chance, "stop": stop}
+
+
+def chip_advice(proj, bs, chips, squad, bank, sell, cfg, forecast=None, plan_gws=None,
+                fh_cache=None):
+    """Value every unused chip in every remaining week of its window, then decide.
+
+    Returns {chip: verdict}. At most one chip comes back with play=True: when two
+    qualify in the same week, the one that loses most by waiting is played and the
+    other is reconsidered next week. Comparing the chips by how much each would
+    lose keeps the comparison inside each chip's own units, rather than weighing
+    captain points against weighted wildcard points as the old tie-break did.
+    """
+    gws = proj.gws
     g0 = gws[0]
-    squad_at = {w["gw"]: w["squad"] for w in plan["weeks"]}
-    last_squad = plan["weeks"][-1]["squad"]
-    sq = lambda g: squad_at.get(g, last_squad)
-    budget = bank + sum(sell.values())
-    results = {}
+    if not chips:
+        return {}
+    if forecast is None:
+        until = forecast_horizon(bs, gws, chips)
+        forecast = forecast_squads(proj, squad, bank, sell, cfg, until, plan_gws)
 
-    def window(chip):
-        stop = chip_window(bs, chip, g0)
-        return stop, [g for g in gws if stop and g <= stop]
-
-    def verdict(values, minimum, stop, higher_is_better=True):
-        # later weeks are less certain (injuries, form, transfers): discount waiting
-        wait = cfg.get("CHIP_WAIT_DECAY", 0.98)
-        eff = {g: values[g] * wait ** (g - g0) for g in values}
-        best_g = max(eff, key=eff.get)
-        now = values[g0]
-        beyond = stop and stop > gws[-1]
-        last_chance = stop == g0
-        # an unused chip is worth nothing: once the whole window is visible, just use
-        # the best week - the minimum only applies while later weeks are out of view
-        visible = bool(stop) and stop <= gws[-1]
-        min_ok = now >= minimum or (visible and cfg.get("CHIP_IGNORE_MIN_IF_VISIBLE", True))
-        play = (min_ok and now >= cfg["CHIP_RATIO"] * eff[best_g]) or (last_chance and now > 0)
-        return play, best_g, now, beyond
-
-    def weak(now, minimum, unit):
-        if cfg.get("CHIP_IGNORE_MIN_IF_VISIBLE", True):
-            return f"save. Best week in view is now, but later weeks outside the view may be better."
-        return (f"save. This is the best week in view, but only {now:.1f} {unit} "
-                f"(want {minimum}+ - usually a double or blank gameweek).")
-
+    top_pct = cfg.get("CHIP_TOP_PCT", {})
+    fh_cache = {} if fh_cache is None else fh_cache
+    out = {}
     for chip in chips:
-        stop, win = window(chip)
-        if not win:
-            results[chip] = (False, 0, "not usable this gameweek.")
+        stop = chip_window(bs, chip, g0)
+        weeks = [g for g in gws if stop and g <= stop and g in forecast]
+        if not weeks:
             continue
-        if chip == "3xc":
-            vals = {g: best_xi(df, sq(g), g)["cap_xp"] for g in win}
-            play, bg, now, beyond = verdict(vals, cfg["TC_MIN"], stop)
-            cap = df.loc[best_xi(df, sq(bg), bg)["cap"], "name"]
-            msg = (f"PLAY on {df.loc[best_xi(df, sq(g0), g0)['cap'], 'name']} ({now:.1f} xP)."
-                   if play else weak(now, cfg["TC_MIN"], "captain xP") if bg == g0 else
-                   f"save. Best week: GW{bg} ({cap}, {vals[bg]:.1f} xP) vs {now:.1f} now.")
-            results[chip] = (play, now, msg)
-        elif chip == "bboost":
-            vals = {g: best_xi(df, sq(g), g)["bench_pts"] for g in win}
-            play, bg, now, beyond = verdict(vals, cfg["BBOOST_MIN"], stop)
-            msg = (f"PLAY - bench projects {now:.1f} pts." if play else
-                   weak(now, cfg["BBOOST_MIN"], "bench pts") if bg == g0 else
-                   f"save. Best week: GW{bg} (bench {vals[bg]:.1f}) vs {now:.1f} now.")
-            results[chip] = (play, now, msg)
-        elif chip == "freehit":
-            vals, fh_squads = {}, {}
-            for g in win:
-                fh, fh_pts = free_hit_squad(df, g, budget, cfg)
-                vals[g] = fh_pts - best_xi(df, sq(g), g)["total"]
-                fh_squads[g] = fh
-            play, bg, now, beyond = verdict(vals, cfg["FREEHIT_THRESHOLD"], stop)
-            msg = (f"PLAY - a one-week squad gains {now:+.1f} pts." if play else
-                   weak(now, cfg["FREEHIT_THRESHOLD"], "pts gain") if bg == g0 else
-                   f"save. Best week: GW{bg} ({vals[bg]:+.1f} pts) vs {now:+.1f} now.")
-            results[chip] = (play, now, msg, fh_squads.get(g0))
-        elif chip == "wildcard":
-            vals, plans = {}, {}
-            for k, g in enumerate(plan["weeks"][:3]):
-                if g["gw"] not in win:
-                    continue
-                p = plan_transfers(df, gws, squad, bank, sell, cfg, wc_week=k, pool=pool)
-                if p:
-                    vals[g["gw"]] = p["objective"] - plan["objective"]
-                    plans[g["gw"]] = p
-            if not vals:
-                results[chip] = (False, 0, "couldn't evaluate.")
-                continue
-            bg = max(vals, key=vals.get)
-            now = vals.get(g0, 0)
-            play = bg == g0 and now >= cfg["WILDCARD_THRESHOLD"]
-            msg = (f"PLAY - rebuilding gains {now:+.1f} weighted pts." if play else
-                   f"save. Best timing: GW{bg} ({vals[bg]:+.1f} pts) vs {now:+.1f} now "
-                   f"(needs +{cfg['WILDCARD_THRESHOLD']}).")
-            results[chip] = (play, now, msg, plans.get(g0))
-        if stop and stop - g0 <= 3:
-            r = results[chip]
-            results[chip] = (r[0], r[1], r[2] + f"  ⚠ Expires after GW{stop}!", *r[3:])
-        if stop and stop > gws[-1]:
-            r = results[chip]
-            results[chip] = (r[0], r[1], r[2] + f" (can't see beyond GW{gws[-1]}; "
-                             f"chip lasts to GW{stop})", *r[3:])
+        values = {g: chip_value(chip, g, proj, forecast[g], cfg, fh_cache) for g in weeks}
+        v = rank_verdict(values, g0, stop, top_pct.get(chip, 0.15))
+        v["visible_to"] = gws[-1]
+        v["beyond_view"] = bool(stop and stop > gws[-1])
+        if chip == "freehit" and v["play"]:
+            key = (g0, round(forecast[g0]["budget"], 1))
+            v["squad"] = fh_cache[key][0] if key in fh_cache else \
+                free_hit_squad(proj.df, g0, forecast[g0]["budget"], cfg)[0]
+        out[chip] = v
 
-    # only one chip per gameweek: keep the most valuable
-    playing = [c for c in results if results[c][0]]
+    playing = [c for c in out if out[c]["play"]]
     if len(playing) > 1:
-        keep = max(playing, key=lambda c: results[c][1])
+        keep = max(playing, key=lambda c: out[c]["regret"])
         for c in playing:
             if c != keep:
-                r = results[c]
-                results[c] = (False, r[1], f"save - {CHIP_NAMES[keep]} is worth more this week.",
-                              *r[3:])
-    return results
+                out[c]["play"] = False
+                out[c]["deferred_for"] = keep
+    return out
+
+
+def chip_line(chip, v):
+    """One line of the chip table for the report."""
+    name = CHIP_NAMES[chip]
+    share = v["rank"] / v["n"]
+    where = (f"this week #{v['rank']} of {v['n']} remaining (top {share:.0%}, "
+             f"playing if in top {v['cutoff'] / v['n']:.0%})")
+    if v["play"]:
+        verdict = "PLAY" + (" - last week of the window" if v["last_chance"]
+                            and v["rank"] > v["cutoff"] else "")
+    elif v.get("deferred_for"):
+        verdict = f"save - {CHIP_NAMES[v['deferred_for']]} loses more by waiting"
+    elif v["now"] <= 0:
+        verdict = "save - worth nothing this week"
+    else:
+        verdict = f"save - best remaining week is GW{v['best_gw']} ({v['values'][v['best_gw']]:+.1f})"
+    note = ""
+    if v["beyond_view"]:
+        note = f"  (can't see past GW{v['visible_to']}; window runs to GW{v['stop']})"
+    elif v["stop"] and v["stop"] - list(sorted(v["values"]))[0] <= 3:
+        note = f"  ⚠ expires after GW{v['stop']}"
+    return f"  {name}: {v['now']:+.1f} now, {where} -> {verdict}{note}"
 
 
 # ---------------------------------------------------------------------
@@ -1040,26 +1172,35 @@ def choose_transfers(proj, gws, squad, bank, sell, cfg, pool=None):
     return plans, max(plans, key=lambda n: plans[n]["objective"]), pool
 
 
-def decide_week(proj, gws, bs, squad, bank, sell, cfg, chips=()):
+def decide_week(proj, gws, bs, squad, bank, sell, cfg, chips=(), forecast=None,
+                fh_cache=None):
     """Plan this week's transfers, then decide whether a chip beats them."""
-    df = proj.df
     plans, best_n, pool = choose_transfers(proj, gws, squad, bank, sell, cfg)
     plan = plans[best_n]
-    advice = chip_advice(df, gws, bs, chips, plan, squad, bank, sell, cfg, pool) if chips else {}
-    chip = next((c for c, r in advice.items() if r[0]), None)
+    advice = (chip_advice(proj, bs, chips, squad, bank, sell, cfg, forecast, plan_gws=gws,
+                          fh_cache=fh_cache) if chips else {})
+    chip = next((c for c, v in advice.items() if v["play"]), None)
 
     d = Decision(plans=plans, best_n=best_n, plan=plan, advice=advice, bank=bank)
 
-    if chip == "freehit" and advice["freehit"][3]:
+    if chip == "freehit":
         # A borrowed squad for one week: no permanent moves, so the real squad,
         # the bank and the saved free transfers are all untouched.
-        d.chip, d.squad, d.keep_squad = "freehit", advice["freehit"][3], False
+        d.chip, d.squad, d.keep_squad = "freehit", advice["freehit"]["squad"], False
         return d
 
-    if chip == "wildcard" and advice["wildcard"][3]:
-        d.chip, d.plan = "wildcard", advice["wildcard"][3]
-        wk = d.plan["weeks"][0]
-        d.hits = 0                          # unlimited free transfers
+    if chip == "wildcard":
+        # Only now is the full planner run with the wildcard in place; the value
+        # used to rank the weeks was a single cheap solve.
+        wc = plan_transfers(proj.df, gws, squad, bank, sell, cfg, wc_week=0, pool=pool)
+        if wc:
+            d.chip, d.plan = "wildcard", wc
+            wk = wc["weeks"][0]
+            d.hits = 0                      # unlimited free transfers
+        else:
+            advice["wildcard"]["play"] = False
+            wk = plan["weeks"][0]
+            d.hits = wk["hits"]
     else:
         wk = plan["weeks"][0]
         d.hits = wk["hits"]
@@ -1247,8 +1388,8 @@ def run(cfg=None, data=None, past=None):
     print(f"\n{L}\n CHIPS  (compared across every week of each chip's window)\n{L}")
     if not chips:
         print("  No chips available.")
-    for chip, r in advice.items():
-        print(f"  {CHIP_NAMES[chip]}: {r[2]}")
+    for chip, v in advice.items():
+        print(chip_line(chip, v))
     if unscheduled:
         teams = sorted({ts["short"][t] for fx in unscheduled for t in (fx["team_h"], fx["team_a"])})
         print(f"  ℹ {len(unscheduled)} fixture(s) not yet scheduled ({', '.join(teams)}). "
