@@ -47,10 +47,14 @@ def download(season):
     if prev:
         wanted[f"{prev}_gws_merged_gw.csv"] = f"{prev}/gws/merged_gw.csv"
         wanted[f"{prev}_players_raw.csv"] = f"{prev}/players_raw.csv"
-    import urllib.request
+    import requests
     for local, remote in wanted.items():
         if not (DATA / local).exists():
-            urllib.request.urlretrieve(ARCHIVE + remote, DATA / local)
+            # requests, not urllib: urllib uses the system trust store, which on a
+            # stock python.org install has no CA bundle.
+            r = requests.get(ARCHIVE + remote, timeout=120)
+            r.raise_for_status()
+            (DATA / local).write_bytes(r.content)
             print("downloaded", local)
 
 
@@ -120,6 +124,11 @@ class ArchiveSource:
             if pid not in self.players.index:
                 continue
             pl = self.players.loc[pid]
+            # 2024-25 carried element_type 5, the Assistant Manager slot, which
+            # FPL dropped again for 2025-26. This engine picks a 15-man squad of
+            # positions 1-4, so managers are not players here.
+            if int(pl["element_type"]) not in E.POS:
+                continue
             c = cum.loc[pid] if pid in cum.index else None
             row = now.loc[pid] if pid in now.index else last.loc[pid]
             cop = None
@@ -267,7 +276,47 @@ def initial_squad(projector, cfg):
     return squad
 
 
-def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
+def record_week(source, proj, bs, pos, chips, forecast, squad, lu, gw_pts, t, cfg, fh_cache):
+    """What each chip was projected to be worth this week, and what it really paid.
+
+    Recording both is what lets the top-x% rule be tuned by replay instead of by
+    re-running the season for every candidate value. It only works because Triple
+    Captain and Bench Boost do not change the squad and Free Hit changes it for a
+    single week, so these payoffs are independent of when the chips are played.
+    """
+    mins = lambda i: source.minutes.get((i, t), 0)
+    pts = lambda i: source.actual.get((i, t), 0)
+    out = {}
+    for c in chips:
+        stop = E.chip_window(bs, c, t)
+        if stop is None:
+            continue
+        weeks = [g for g in proj.gws if g <= stop and g in forecast]
+        if not weeks:
+            continue
+        values = {g: E.chip_value(c, g, proj, forecast[g], cfg, fh_cache) for g in weeks}
+        if c == "3xc":
+            armband = lu["cap"] if mins(lu["cap"]) > 0 else lu["vice"]
+            actual = pts(armband)                       # the extra armband
+        elif c == "bboost":
+            actual = sum(pts(i) for i in lu["bench"])
+        elif c == "freehit":
+            budget = forecast[t]["budget"]
+            key = (t, round(budget, 1))
+            fh = fh_cache[key][0] if key in fh_cache else \
+                E.free_hit_squad(proj.df, t, budget, cfg)[0]
+            fl = lineup(proj, fh, t, cfg)
+            actual = actual_score(source, pos, fh, fl["xi"], fl["cap"], fl["vice"],
+                                  fl["bench"], t, None) - gw_pts
+        else:                                           # wildcard: changes the squad
+            actual = None                               # only full sims can price it
+        out[c] = {"values": {int(g): round(float(v), 3) for g, v in values.items()},
+                  "stop": int(stop), "actual": actual}
+    return out
+
+
+def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False,
+             record_chips=False):
     """Replay a season. The engine decides; this function only applies and scores.
 
     Every decision comes from `E.decide_week`, the same call the live report makes.
@@ -306,15 +355,18 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
         chips = E.chips_left(bs, t, used) if cfg.get("USE_CHIPS", True) else []
         cfg["FREE_TRANSFERS"] = ft
 
-        d = E.decide_week(proj, plan_gws, bs, squad, bank, sell, cfg, chips,
-                          fh_cache=fh_cache)
+        # Only these chips may actually be played. Recording runs restrict this to
+        # the wildcard so the squad trajectory does not depend on the very
+        # decisions being tuned.
+        allowed = [c for c in chips if c in cfg.get("PLAYABLE_CHIPS", E.CHIP_NAMES)]
+        forecast = None
+        if chips:
+            until = E.forecast_horizon(bs, proj.gws, chips)
+            forecast = E.forecast_squads(proj, squad, bank, sell, cfg, until, plan_gws)
+
+        d = E.decide_week(proj, plan_gws, bs, squad, bank, sell, cfg, allowed,
+                          forecast=forecast, fh_cache=fh_cache)
         chip = d.chip
-        if d.advice:
-            # Keep every chip's opportunity table: tuning the top-x% rule later
-            # replays these instead of re-running the season for each value.
-            chip_tables[t] = {c: {"values": dict(v["values"]), "rank": v["rank"],
-                                  "n": v["n"], "played": c == chip}
-                              for c, v in d.advice.items()}
         if chip:
             used.add((chip, E.chip_window(bs, chip, t)))
 
@@ -340,6 +392,9 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
         lu = lineup(proj, squad, t, cfg)
         gw_pts = actual_score(source, pos, squad, lu["xi"], lu["cap"], lu["vice"],
                               lu["bench"], t, chip)
+        if record_chips and chips:
+            chip_tables[t] = record_week(source, proj, bs, pos, chips, forecast,
+                                         squad, lu, gw_pts, t, cfg, fh_cache)
         total += gw_pts - cfg["HIT_COST_REAL"] * d.hits
         hits_total += d.hits
         log.append((t, chip or "", len(d.ins), d.hits))
@@ -355,6 +410,80 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False):
     return {"label": label, "total": total, "hits": hits_total,
             "transfers": sum(l[2] for l in log if len(l) > 3),
             "chips": chips_txt, "log": log, "chip_tables": chip_tables}
+
+
+def starting_squads(projector, cfg, n=5, seed=0):
+    """`n` legal opening squads, varied around the best one.
+
+    One squad over one season gives only eight chip decisions - far too few to
+    choose a threshold from. Every candidate x is compared on identical squads.
+    """
+    import random
+    rng = random.Random(seed)
+    base = initial_squad(projector, cfg)
+    df = projector.data[1][0].df
+    out = [list(base)]
+    while len(out) < n:
+        squad = list(base)
+        for _ in range(rng.randint(2, 5)):
+            k = rng.randrange(15)
+            p, old = df.loc[squad[k], "pos"], squad[k]
+            budget = df.loc[old, "price"] + 0.5
+            cands = df[(df["pos"] == p) & df["can_select"] & (df["price"] <= budget)]
+            cands = cands.sort_values(f"gw{1}", ascending=False).head(25).index
+            pick = int(rng.choice(list(cands)))
+            if pick not in squad:
+                squad[k] = pick
+        # keep it legal: 15 different players, at most 3 per club, within £100m
+        if len(set(squad)) != 15 or df.loc[squad, "price"].sum() > 100.0:
+            continue
+        if df.loc[squad, "team_id"].value_counts().max() > 3:
+            continue
+        if squad not in out:
+            out.append(squad)
+    return out
+
+
+def replay_chip(tables, chip, x, taken=None):
+    """Apply the top-x% rule to a recorded opportunity table.
+
+    Walks the season in order, so a chip is spent once per window and cannot be
+    played in a week another chip has already claimed.
+    """
+    taken = set() if taken is None else taken
+    used, played = set(), []
+    for t in sorted(tables):
+        week = tables[t]
+        if chip not in week or t in taken:
+            continue
+        info = week[chip]
+        stop = info["stop"]
+        if (chip, stop) in used:
+            continue
+        values = {int(g): v for g, v in info["values"].items()}
+        if t not in values:
+            continue
+        v = E.rank_verdict(values, t, stop, x)
+        if v["play"]:
+            used.add((chip, stop))
+            played.append({"gw": t, "value": values[t], "actual": info["actual"],
+                           "rank": v["rank"], "n": v["n"]})
+            taken.add(t)
+    return played
+
+
+def sweep_chip(records, chip, grid):
+    """Total real points each x would have earned, across every recorded season."""
+    rows = []
+    for x in grid:
+        gained, weeks = 0.0, []
+        for rec in records:
+            played = replay_chip(rec["tables"], chip, x)
+            gained += sum(p["actual"] for p in played if p["actual"] is not None)
+            weeks += [(rec["season"], rec["squad"], p["gw"]) for p in played]
+        rows.append({"x": x, "total": gained, "per_run": gained / max(len(records), 1),
+                     "weeks": weeks})
+    return rows
 
 
 def run_grid(projector, runs, base_cfg, results_file, last_gw=38):
