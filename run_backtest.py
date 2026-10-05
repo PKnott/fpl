@@ -4,6 +4,7 @@
   python run_backtest.py tune   [--grid 0,0.05,...]
   python run_backtest.py wildcard [--seasons 2023-24,...]
   python run_backtest.py gaps
+  python run_backtest.py bars [--chip bboost] [--bars 4,6,8,...]
   python run_backtest.py policy [--ranks 0.05,0.15,0.30] [--gaps 5,10,15,20]
 
 `record` runs one full season per (season, starting squad) with only the wildcard
@@ -153,6 +154,32 @@ def wildcard_report(seasons):
               + "   " + "; ".join(f"{s}: {rule[s][1]}" for s in seasons if s in rule))
 
 
+def cmd_bars(a):
+    """Replay the bar rule (play once this week's value reaches the bar) per chip,
+    next to the current top-x% rule."""
+    recs = load_records()
+    if not recs:
+        sys.exit("no records found - run `python run_backtest.py record` first")
+    chip = a.chip
+    seasons = sorted({r["season"] for r in recs})
+    x_now = E.DEFAULTS["CHIP_TOP_PCT"][chip]
+    print(f"{E.CHIP_NAMES[chip]}: bar rule vs top-{x_now:.0%} rule, "
+          f"{len(recs)} runs over {len(seasons)} seasons\n")
+    print(f"  {'rule':>10}{'pts/run':>10}{'se':>8}   per season")
+    rules = [(f"top {x_now:.2f}", dict(bar=None))] + \
+            [(f"bar {b:g}", dict(bar=b)) for b in [float(v) for v in a.bars.split(",")]]
+    for label, kw in rules:
+        per_run, by_season = [], {}
+        for rec in recs:
+            played = B.replay_chip(rec["tables"], chip, x_now, **kw)
+            got = sum(p["actual"] for p in played if p["actual"] is not None)
+            per_run.append(got)
+            by_season.setdefault(rec["season"], []).append(got)
+        se = statistics.stdev(per_run) / len(per_run) ** 0.5
+        cells = "  ".join(f"{s[-5:]} {statistics.mean(v):>5.1f}" for s, v in sorted(by_season.items()))
+        print(f"  {label:>10}{statistics.mean(per_run):>10.1f}{se:>8.1f}   {cells}")
+
+
 def cmd_gaps(a):
     """How big the wildcard gap gets, by stage of season - the history a bar is set from."""
     recs = load_records()
@@ -289,6 +316,10 @@ if __name__ == "__main__":
     t = sub.add_parser("tune")
     t.add_argument("--grid")
     t.set_defaults(func=cmd_tune)
+    br = sub.add_parser("bars")
+    br.add_argument("--chip", default="bboost")
+    br.add_argument("--bars", default="4,6,8,10,12,14,16,18,20")
+    br.set_defaults(func=cmd_bars)
     g = sub.add_parser("gaps")
     g.set_defaults(func=cmd_gaps)
     pol = sub.add_parser("policy")

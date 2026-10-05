@@ -470,8 +470,11 @@ def starting_squads(projector, cfg, n=5, seed=0):
     return out
 
 
-def replay_chip(tables, chip, x, taken=None):
+def replay_chip(tables, chip, x, taken=None, bar=None):
     """Apply the top-x% rule to a recorded opportunity table.
+
+    With `bar`, apply the bar rule instead: play once this week's value reaches
+    `bar`, or in the window's last week.
 
     Walks the season in order, so a chip is spent once per window and cannot be
     played in a week another chip has already claimed.
@@ -490,6 +493,8 @@ def replay_chip(tables, chip, x, taken=None):
         if t not in values:
             continue
         v = E.rank_verdict(values, t, stop, x)
+        if bar is not None:
+            v["play"] = bool(values[t] > 0 and (values[t] >= bar or t == stop))
         if v["play"]:
             used.add((chip, stop))
             played.append({"gw": t, "value": values[t], "actual": info["actual"],

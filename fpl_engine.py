@@ -141,7 +141,7 @@ DEFAULTS = {
     # window. The bar tightens on its own as the window runs out and reaches
     # certainty in the last week, so no absolute point minimums are needed.
     # Backtest-tuned per chip.
-    "CHIP_TOP_PCT": {"3xc": 0.15, "bboost": 0.15, "freehit": 0.05, "wildcard": 0.15},
+    "CHIP_TOP_PCT": {"3xc": 0.15, "bboost": 0.40, "freehit": 0.05, "wildcard": 0.15},
 
     # ---- solver ----
     "SOLVER_SECONDS": 60,           # time limit per optimisation
@@ -1131,10 +1131,13 @@ def chip_advice(proj, bs, chips, squad, bank, sell, cfg, forecast=None, plan_gws
         weeks = [g for g in gws if stop and g <= stop and g in forecast]
         if not weeks:
             continue
-        gap_bar = cfg.get("WILDCARD_GAP") if chip == "wildcard" else None
+        gap_bar = (cfg.get("CHIP_BAR") or {}).get(chip)
+        if chip == "wildcard" and cfg.get("WILDCARD_GAP") is not None:
+            gap_bar = cfg["WILDCARD_GAP"]
         if gap_bar is not None:
-            # Gap rule: play when a rebuild adds at least `gap_bar` points now, rather
-            # than ranking this week against a forecast that assumes no news.
+            # Bar rule: play when the chip is worth at least `gap_bar` now, rather
+            # than ranking this week against a forecast that assumes no news (which
+            # always makes later weeks look better, so the chip is held too long).
             now = chip_value(chip, g0, proj, forecast[g0], cfg, fh_cache, window_stop=stop)
             last_chance = g0 == stop or len(weeks) == 1
             v = {"play": bool(now > 0 and (now >= gap_bar or last_chance)), "rank": 1, "n": 1,
