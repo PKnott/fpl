@@ -189,7 +189,8 @@ Two experiments:
 
 ### Chip thresholds
 
-Real points each chip added per season, replayed from 15 recorded seasons:
+Real points each chip added per season, replayed from the 15 recordings (3 seasons ×
+5 starting squads):
 
 | Chip | Rule | Points per season | Notes |
 |---|---|---|---|
@@ -225,9 +226,9 @@ it at all.
 | Rule | 2023-24 | 2024-25 | 2025-26 | Mean | Wildcards played |
 |---|---|---|---|---|---|
 | Rank against the window (any threshold) | 2,300 | 2,291 | 2,109 | 2,233 | GW2 and GW20, every time |
-| Gap ≥ 15 | 2,300 | 2,266 | 2,155 | 2,240 | |
+| Gap ≥ 15 | 2,300 | 2,266 | 2,155 | 2,240 | GW2, then GW20–24 |
 | **Gap ≥ 20** | **2,383** | **2,314** | **2,178** | **2,292** | GW2–4, then GW23–33 |
-| Gap ≥ 25 | 2,353 | 2,250 | 2,154 | 2,252 | |
+| Gap ≥ 25 | 2,353 | 2,250 | 2,154 | 2,252 | GW2–5, second sometimes never |
 | Gap ≥ 30 | 2,330 | 2,353 | 2,086 | 2,256 | often only fires once |
 
 Gap ≥ 20 beat the old rule in all three seasons, by about 58 points a season. It
@@ -310,10 +311,11 @@ showed on its own:
   Settings are split into `DEFAULTS` (the model, which the backtest tunes) and
   `USER` (team ID, free transfers, injury overrides).
 - **Refactors proven to change nothing.** `verify.py` runs the engine against
-  frozen reference outputs: projections for five gameweeks across a season, plus a
-  full-season simulation. Every setting is pinned from `reference/ref_cfg.json`, so
-  a deliberate change of defaults can't be mistaken for a refactor bug. The
-  projection snapshots still match the reference exactly.
+  frozen reference outputs: projections for five gameweeks across a season. Every
+  setting is pinned from `reference/ref_cfg.json`, so a deliberate change of
+  defaults can't be mistaken for a refactor bug, and the snapshots still match
+  exactly. Its full-season check only applied until the chip rules were
+  deliberately rewritten, so `--projections-only` is the check to run now.
 - **Deliberate behaviour changes are recorded with their effect.** When the
   simulator switched to the autosub-aware lineup the live report uses, the
   2025-26 reference season moved from 2,022 to 2,030 points
@@ -338,6 +340,11 @@ showed on its own:
 - The archive has no injury flags. In the backtest, a regular starter who missed
   his team's last one or two games is treated as doubtful. Live runs use FPL's own
   flags.
+- Three seasons is a small sample for a decision made twice a season. The wildcard
+  results are consistent across seasons and squads, but the size of the gain is
+  an estimate, not a precise figure.
+- The forecast behind the ranking rule still assumes no bad news. For the Bench
+  Boost that bias is offset with a looser threshold rather than removed.
 
 ---
 
@@ -394,5 +401,5 @@ reference/                  frozen outputs and config used by verify.py
 _ref_current/               the pre-refactor code, kept as the verification baseline
 ```
 
-`bt_data/` (archive CSVs) and `bt_cache/` (about 500 MB of projection caches
-and records) are gitignored and rebuilt on demand.
+`bt_data/` (archive CSVs) and `bt_cache/` (projection caches, recordings and
+experiment results, a couple of GB) are gitignored and rebuilt on demand.
