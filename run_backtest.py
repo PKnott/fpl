@@ -83,6 +83,12 @@ def load_records():
     for p in sorted(RECORDS.glob("*.json")):
         d = json.loads(p.read_text())
         d["tables"] = {int(k): v for k, v in d["tables"].items()}
+        # Records written before record_week cast `actual` to float hold numpy ints,
+        # which json.dumps(default=str) saved as strings.
+        for week in d["tables"].values():
+            for info in week.values():
+                if isinstance(info.get("actual"), str):
+                    info["actual"] = float(info["actual"])
         recs.append(d)
     return recs
 

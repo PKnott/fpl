@@ -123,7 +123,7 @@ DEFAULTS = {
     # window. The bar tightens on its own as the window runs out and reaches
     # certainty in the last week, so no absolute point minimums are needed.
     # Backtest-tuned per chip.
-    "CHIP_TOP_PCT": {"3xc": 0.15, "bboost": 0.15, "freehit": 0.15, "wildcard": 0.15},
+    "CHIP_TOP_PCT": {"3xc": 0.15, "bboost": 0.15, "freehit": 0.05, "wildcard": 0.15},
 
     # ---- solver ----
     "SOLVER_SECONDS": 60,           # time limit per optimisation

@@ -317,7 +317,7 @@ def record_week(source, proj, bs, pos, chips, forecast, squad, lu, gw_pts, t, cf
         else:
             continue
         out[c] = {"values": {int(g): round(float(v), 3) for g, v in values.items()},
-                  "stop": int(stop), "actual": actual}
+                  "stop": int(stop), "actual": float(actual)}
     return out
 
 
