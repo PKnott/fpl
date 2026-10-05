@@ -74,10 +74,14 @@ DEFAULTS = {
     #   PLAN_WEEKS        weeks of transfers solved together
     #   LONG_VIEW         weeks used for a squad's long-term value (the tail)
     #   PROJECTION_WEEKS  how far points are projected at all. Chips need more than
-    #                     LONG_VIEW: valuing a wildcard at GW19 over WC_VALUE_WEEKS=6
-    #                     needs GW25, which is 24 weeks out from GW2. A chip's own
-    #                     horizon comes from its expiry, not from any of these.
-    "PROJECTION_WEEKS": 24,
+    #                     LONG_VIEW: a wildcard in week g is valued over the LONG_VIEW
+    #                     weeks from g, so every week of its window needs projections
+    #                     LONG_VIEW past it. At 24 a GW17 wildcard seen from GW2 was
+    #                     valued over 9 weeks and a GW3 one over 19, so later weeks
+    #                     lost by construction and the rule always played early.
+    #                     38 = to the end of the season; the view then only shortens
+    #                     when the season itself is running out.
+    "PROJECTION_WEEKS": 38,
     "PLAN_WEEKS": 5,                # weeks of transfers planned together
     "LONG_VIEW": 19,                # weeks of projections used for long-term value
     "DECAY": 0.8,                   # later weeks count a bit less (uncertainty)
@@ -95,8 +99,22 @@ DEFAULTS = {
     # Last season, split into its two separate jobs:
     "LAST_SEASON_STATS": True,      # blend last season's per-90 stats (xG, xA, bonus...)
     "LAST_SEASON_MINUTES": 540,     #   ...counted as this many minutes
-    "LAST_SEASON_STARTS": False,    # use last season's starts to predict who plays
+    # Use last season's starts to predict who plays. Only reached when a player has
+    # no games yet this season (the recency-weighted model needs at least one), so
+    # in practice it is GW1 - where without it every player projects 0 minutes.
+    "LAST_SEASON_STARTS": True,
     "LAST_SEASON_STARTS_GAMES": 3,  #   ...counted as this many games (early season only)
+    # Per stat (last season, position average) weights in minutes, overriding the
+    # two above. Fitted by signal_noise.py: for each stat, the weights that best
+    # predict the rest of the season, scored on held-out seasons. xG and xA keep
+    # the defaults (already near-optimal); the noisy stats lean much harder on the
+    # past - a run of goals or bonus over a few weeks is mostly luck. A key with
+    # "|GK" or "|OUT" applies to keepers or outfield players only.
+    "STAT_PRIOR_MINUTES": {
+        "goals_scored": [2700, 900], "assists": [2700, 1350],
+        "bonus|OUT": [1800, 900], "bonus|GK": [5400, 6750],
+        "saves": [900, 90], "yellow_cards": [2700, 1350],
+    },
     # Goalkeepers get their own steadying (saves & bonus are very noisy).
     # None = use PRIOR_MINUTES like everyone else.
     "GK_PRIOR_MINUTES": 360,
@@ -374,6 +392,13 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
     M0_ALL = cfg.get("PRIOR_MINUTES", 270)
     M0_GK = cfg.get("GK_PRIOR_MINUTES") or M0_ALL
     G_LAST = cfg.get("LAST_SEASON_STARTS_GAMES", 3)
+    # Per-stat (last season, position average) weights in minutes, overriding the
+    # two above. Keys are a stat, or "<stat>|GK" for keepers only.
+    stat_w = {}
+    for k, v in sorted((cfg.get("STAT_PRIOR_MINUTES") or {}).items(), key=lambda kv: "|" in kv[0]):
+        stat, _, grp = k.partition("|")
+        for gk in ((True,) if grp == "GK" else (False,) if grp == "OUT" else (True, False)):
+            stat_w[(stat, gk)] = (v[0] if stats_on else 0, v[1])
     exact_saves = cfg.get("EXACT_SAVES", False)
     m_decay = cfg.get("MINUTES_DECAY")
     rows, breakdown = [], {}
@@ -388,14 +413,15 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
 
         def rate(key):
             # this season + position average (always) + last season (if on, added on top)
+            k_last, m0 = stat_w.get((key, pt == 1), (K_LAST, M0))
             obs = per90(e, key, mins)
-            num, den = mins * obs + M0 * priors[pt][key], mins + M0
-            info = {"this": obs, "this_w": mins, "prior": priors[pt][key], "prior_w": M0,
+            num, den = mins * obs + m0 * priors[pt][key], mins + m0
+            info = {"this": obs, "this_w": mins, "prior": priors[pt][key], "prior_w": m0,
                     "last": None, "last_w": 0}
-            if last and K_LAST and key in last:
-                info["last"], info["last_w"] = per90(last, key, last_mins), K_LAST
-                num += K_LAST * info["last"]
-                den += K_LAST
+            if last and k_last and key in last:
+                info["last"], info["last_w"] = per90(last, key, last_mins), k_last
+                num += k_last * info["last"]
+                den += k_last
             info["blended"] = num / den if den else 0.0
             rate_info[key] = info
             return info["blended"]
@@ -989,7 +1015,7 @@ def forecast_horizon(bs, gws, chips):
 
 
 
-def chip_value(chip, g, proj, state, cfg, fh_cache=None):
+def chip_value(chip, g, proj, state, cfg, fh_cache=None, window_stop=None):
     """What `chip` would be worth if played in gameweek `g`.
 
     `state` is one week of `forecast_squads`, so every week is measured against
@@ -1028,6 +1054,11 @@ def chip_value(chip, g, proj, state, cfg, fh_cache=None):
         # week, because the forecast assumes you keep transferring towards the same
         # optimum, so it would rank the first week of the window best every time and
         # the chip would always be played immediately.
+        #
+        # A first-half wildcard is only credited up to the end of its window: from
+        # the next window's first week a fresh wildcard can rebuild the squad anyway,
+        # so benefit after that is not this chip's. Without the cap a GW17 wildcard
+        # was credited out to GW35. WC_CAP_AT_NEXT_WINDOW=False restores it.
         before, baseline = state["before"], state["objective"]
         if baseline is None:
             return 0.0
@@ -1035,7 +1066,18 @@ def chip_value(chip, g, proj, state, cfg, fh_cache=None):
                     SOLVER_SECONDS=cfg.get("PATH_SOLVER_SECONDS", 5))
         pool, _ = solver_pool(df, before["squad"], wcfg,
                               per_pos=cfg.get("FORECAST_POOL_PER_POS", 20))
-        p = plan_transfers(df, before["remaining"], before["squad"], before["bank"],
+        weeks = before["remaining"]
+        if window_stop and window_stop < 38 and cfg.get("WC_CAP_AT_NEXT_WINDOW", True):
+            capped = [w for w in weeks if w <= window_stop]
+            if len(capped) < len(weeks):
+                # the baseline must cover the same weeks, so re-solve it too
+                weeks = capped
+                b = plan_transfers(df, weeks, before["squad"], before["bank"],
+                                   before["sell"], wcfg, pool=pool)
+                if not b:
+                    return 0.0
+                baseline = b["objective"]
+        p = plan_transfers(df, weeks, before["squad"], before["bank"],
                            before["sell"], wcfg, wc_week=0, pool=pool)
         return (p["objective"] - baseline) if p else 0.0
 
@@ -1089,8 +1131,20 @@ def chip_advice(proj, bs, chips, squad, bank, sell, cfg, forecast=None, plan_gws
         weeks = [g for g in gws if stop and g <= stop and g in forecast]
         if not weeks:
             continue
-        values = {g: chip_value(chip, g, proj, forecast[g], cfg, fh_cache) for g in weeks}
-        v = rank_verdict(values, g0, stop, top_pct.get(chip, 0.15))
+        gap_bar = cfg.get("WILDCARD_GAP") if chip == "wildcard" else None
+        if gap_bar is not None:
+            # Gap rule: play when a rebuild adds at least `gap_bar` points now, rather
+            # than ranking this week against a forecast that assumes no news.
+            now = chip_value(chip, g0, proj, forecast[g0], cfg, fh_cache, window_stop=stop)
+            last_chance = g0 == stop or len(weeks) == 1
+            v = {"play": bool(now > 0 and (now >= gap_bar or last_chance)), "rank": 1, "n": 1,
+                 "cutoff": 1, "now": now, "best_gw": g0, "values": {g0: now},
+                 "regret": float("inf") if last_chance else now - gap_bar,
+                 "last_chance": last_chance, "stop": stop, "gap_bar": gap_bar}
+        else:
+            values = {g: chip_value(chip, g, proj, forecast[g], cfg, fh_cache, window_stop=stop)
+                  for g in weeks}
+            v = rank_verdict(values, g0, stop, top_pct.get(chip, 0.15))
         v["visible_to"] = gws[-1]
         v["beyond_view"] = bool(stop and stop > gws[-1])
         if chip == "freehit" and v["play"]:
@@ -1115,6 +1169,10 @@ def chip_line(chip, v):
     share = v["rank"] / v["n"]
     where = (f"this week #{v['rank']} of {v['n']} remaining (top {share:.0%}, "
              f"playing if in top {v['cutoff'] / v['n']:.0%})")
+    if "gap_bar" in v:
+        where = f"playing at {v['gap_bar']:+.1f} or more"
+        if not v["play"] and v["now"] > 0:
+            return f"  {name}: {v['now']:+.1f} now, {where} -> save - below the bar"
     if v["play"]:
         verdict = "PLAY" + (" - last week of the window" if v["last_chance"]
                             and v["rank"] > v["cutoff"] else "")
@@ -1160,18 +1218,21 @@ class Decision:
         return len(self.ins)
 
 
-def choose_transfers(proj, gws, squad, bank, sell, cfg, pool=None):
+def choose_transfers(proj, gws, squad, bank, sell, cfg, pool=None, wc_ahead=None):
     """Best multi-week plan for every possible number of transfers this week.
 
     Returns (plans, best_n, pool). Solving each `n_first` separately is what lets
     the report show "0 transfers vs 1 vs 2" as real alternatives rather than one
-    answer; the decision just takes the best objective.
+    answer; the decision just takes the best objective. `wc_ahead` is how many
+    weeks from now a wildcard is already planned, so nothing is bought just to be
+    rebuilt away (and no hits are taken) in the weeks before it.
     """
     if pool is None:
         pool, _ = solver_pool(proj.df, squad, cfg)
     plans = {}
     for n in range(0, cfg["MAX_TRANSFERS"] + 1):
-        p = plan_transfers(proj.df, gws, squad, bank, sell, cfg, n_first=n, pool=pool)
+        p = plan_transfers(proj.df, gws, squad, bank, sell, cfg, n_first=n,
+                           wc_week=wc_ahead, pool=pool)
         if p:
             plans[n] = p
     if not plans:
@@ -1180,13 +1241,20 @@ def choose_transfers(proj, gws, squad, bank, sell, cfg, pool=None):
 
 
 def decide_week(proj, gws, bs, squad, bank, sell, cfg, chips=(), forecast=None,
-                fh_cache=None):
-    """Plan this week's transfers, then decide whether a chip beats them."""
-    plans, best_n, pool = choose_transfers(proj, gws, squad, bank, sell, cfg)
+                fh_cache=None, force_wildcard=False, wc_ahead=None):
+    """Plan this week's transfers, then decide whether a chip beats them.
+
+    `force_wildcard` plays the wildcard this week whatever the timing rule says -
+    the backtest uses it to measure what each week would really have paid.
+    `wc_ahead` is passed on to `choose_transfers`.
+    """
+    plans, best_n, pool = choose_transfers(proj, gws, squad, bank, sell, cfg,
+                                           wc_ahead=wc_ahead)
     plan = plans[best_n]
     advice = (chip_advice(proj, bs, chips, squad, bank, sell, cfg, forecast, plan_gws=gws,
                           fh_cache=fh_cache) if chips else {})
-    chip = next((c for c, v in advice.items() if v["play"]), None)
+    chip = "wildcard" if force_wildcard else \
+        next((c for c, v in advice.items() if v["play"]), None)
 
     d = Decision(plans=plans, best_n=best_n, plan=plan, advice=advice, bank=bank)
 
@@ -1205,7 +1273,8 @@ def decide_week(proj, gws, bs, squad, bank, sell, cfg, chips=(), forecast=None,
             wk = wc["weeks"][0]
             d.hits = 0                      # unlimited free transfers
         else:
-            advice["wildcard"]["play"] = False
+            if "wildcard" in advice:
+                advice["wildcard"]["play"] = False
             wk = plan["weeks"][0]
             d.hits = wk["hits"]
     else:

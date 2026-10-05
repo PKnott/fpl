@@ -2,12 +2,18 @@
 
   python run_backtest.py record [--seasons 2023-24,...] [--squads 5] [--gw 38]
   python run_backtest.py tune   [--grid 0,0.05,...]
+  python run_backtest.py wildcard [--seasons 2023-24,...]
+  python run_backtest.py gaps
+  python run_backtest.py policy [--ranks 0.05,0.15,0.30] [--gaps 5,10,15,20]
 
 `record` runs one full season per (season, starting squad) with only the wildcard
 playable, saving every chip's opportunity table and what that chip really paid in
 that week. `tune` replays those tables for each candidate x, which takes seconds -
 Triple Captain and Bench Boost never change the squad and Free Hit changes it for
 one week, so their payoffs do not depend on when they were played.
+
+`wildcard` can't work that way - a wildcard changes every week after it - so it
+runs a full season for each candidate week instead, one half at a time.
 """
 import argparse
 import json
@@ -41,14 +47,21 @@ def base_cfg(**over):
         over)
 
 
+def projector_for(season):
+    """Projections don't depend on chip rules, so every command shares one cache."""
+    cfg = base_cfg()
+    return B.Projector(B.ArchiveSource(season), cfg, cfg["PROJECTION_WEEKS"])
+
+
 def record_one(args):
     season, squad_ix, last_gw = args
-    cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"])
+    # No chips played: the squad path doesn't depend on any decision being tuned,
+    # and the wildcard's signal is logged every week of the season.
+    cfg = base_cfg(PLAYABLE_CHIPS=[])
     out = RECORDS / f"{season}_squad{squad_ix}_gw{last_gw}.json"
     if out.exists():
         return f"{season} squad {squad_ix}: already recorded, skipping"
-    source = B.ArchiveSource(season)
-    projector = B.Projector(source, cfg, cfg["PROJECTION_WEEKS"])
+    projector = projector_for(season)
     squads = B.starting_squads(projector, cfg, n=8)
     t0 = time.time()
     r = B.simulate(projector, cfg, f"{season}/sq{squad_ix}",
@@ -63,19 +76,149 @@ def record_one(args):
 
 def cmd_record(a):
     seasons = a.seasons.split(",") if a.seasons else SEASONS
-    cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"])
     for s in seasons:
         B.download(s)
         # Build each season's projection cache serially: the workers all share it,
         # and several of them writing the same pickle at once would corrupt it.
         t0 = time.time()
-        B.Projector(B.ArchiveSource(s), cfg, cfg["PROJECTION_WEEKS"])
+        projector_for(s)
         print(f"{s}: projections ready ({time.time() - t0:.0f}s)", flush=True)
     jobs = [(s, i, a.gw) for s in seasons for i in range(a.squads)]
     print(f"{len(jobs)} record runs across {a.workers} workers\n")
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
         for msg in ex.map(record_one, jobs):
             print(msg, flush=True)
+
+
+WILDCARD_DIR = ROOT / "bt_cache" / "wildcard"
+# Candidate weeks per half; None = never play it in that half. The other half is
+# left to the timing rule, so each half is measured with everything else equal.
+WILDCARD_WEEKS = {19: [None, 2, 5, 8, 11, 14, 17], 38: [None, 20, 23, 26, 29, 32, 35]}
+
+
+def wildcard_one(args):
+    season, stop, gw = args
+    out = WILDCARD_DIR / f"{season}_stop{stop}_gw{gw or 'none'}.json"
+    if out.exists():
+        return f"{season} half to GW{stop}, wildcard GW{gw or '-'}: already run, skipping"
+    # The projector is built from the recording config so its cache is shared;
+    # only the simulation sees the forced week.
+    rec_cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"])
+    projector = projector_for(season)
+    start = B.starting_squads(projector, rec_cfg, n=1)[0]
+    cfg = dict(rec_cfg, FORCE_WILDCARD={stop: gw})
+    t0 = time.time()
+    r = B.simulate(projector, cfg, f"{season}/wc{gw}", start=list(start))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"season": season, "stop": stop, "gw": gw, "total": r["total"],
+                               "chips": r["chips"], "log": r["log"]}, default=str))
+    return (f"{season} half to GW{stop}, wildcard GW{gw or '-'}: {r['total']} pts "
+            f"({r['chips'] or 'no wildcard'}, {time.time() - t0:.0f}s)")
+
+
+def cmd_wildcard(a):
+    seasons = a.seasons.split(",") if a.seasons else SEASONS
+    for s in seasons:
+        B.download(s)
+        projector_for(s)
+        print(f"{s}: projections ready", flush=True)
+    jobs = [(s, stop, gw) for s in seasons for stop, weeks in WILDCARD_WEEKS.items()
+            for gw in weeks]
+    print(f"{len(jobs)} full-season runs across {a.workers} workers\n", flush=True)
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        for msg in ex.map(wildcard_one, jobs):
+            print(msg, flush=True)
+    wildcard_report(seasons)
+
+
+def wildcard_report(seasons):
+    """Season totals by forced week, next to what the timing rule did (squad 0)."""
+    rule = {}
+    for rec in load_records():
+        if rec["squad"] == 0:
+            rule[rec["season"]] = (rec["total"], rec["chips"])
+    for stop, weeks in WILDCARD_WEEKS.items():
+        print(f"\nWildcard in the half ending GW{stop} (other half left to the rule)")
+        print(f"  {'week':>6}" + "".join(f"{s:>10}" for s in seasons) + f"{'mean':>9}")
+        for gw in weeks:
+            cells = []
+            for s in seasons:
+                p = WILDCARD_DIR / f"{s}_stop{stop}_gw{gw or 'none'}.json"
+                cells.append(json.loads(p.read_text())["total"] if p.exists() else None)
+            got = [c for c in cells if c is not None]
+            mean = f"{statistics.mean(got):>9.0f}" if got else f"{'':>9}"
+            print(f"  {gw or 'none':>6}" + "".join(f"{c if c is not None else '-':>10}"
+                                                 for c in cells) + mean)
+        print(f"  {'rule':>6}" + "".join(f"{rule.get(s, ('-',))[0]:>10}" for s in seasons)
+              + "   " + "; ".join(f"{s}: {rule[s][1]}" for s in seasons if s in rule))
+
+
+def cmd_gaps(a):
+    """How big the wildcard gap gets, by stage of season - the history a bar is set from."""
+    recs = load_records()
+    rows = [(r["season"], t, w["wildcard"]["gap"]) for r in recs
+            for t, w in r["tables"].items() if "wildcard" in w]
+    if not rows:
+        sys.exit("no wildcard gaps recorded - re-run `record`")
+    import pandas as pd
+    d = pd.DataFrame(rows, columns=["season", "gw", "gap"])
+    d["stage"] = pd.cut(d["gw"], [0, 5, 10, 15, 19, 25, 30, 38],
+                        labels=["2-5", "6-10", "11-15", "16-19", "20-25", "26-30", "31-38"])
+    q = d.groupby("stage", observed=True)["gap"].quantile([0.5, 0.75, 0.9, 1.0]).unstack()
+    q.columns = ["median", "p75", "p90", "max"]
+    print("Wildcard gap (planner points a rebuild adds), no chips played:\n")
+    print(q.round(1).to_string())
+    print("\nBy season, weeks 2-19 / 20-38 (median, p90):")
+    for s, g in d.groupby("season"):
+        h1, h2 = g[g["gw"] <= 19]["gap"], g[g["gw"] >= 20]["gap"]
+        print(f"  {s}: {h1.median():.1f}, {h1.quantile(.9):.1f}  /  "
+              f"{h2.median():.1f}, {h2.quantile(.9):.1f}")
+
+
+POLICY_DIR = ROOT / "bt_cache" / "policy"
+
+
+def policy_one(args):
+    season, label, over = args
+    out = POLICY_DIR / f"{season}_{label}.json"
+    if out.exists():
+        return f"{season} {label}: already run, skipping"
+    cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"], **over)
+    projector = projector_for(season)
+    start = B.starting_squads(projector, cfg, n=1)[0]
+    t0 = time.time()
+    r = B.simulate(projector, cfg, f"{season}/{label}", start=list(start))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"season": season, "label": label, "over": over,
+                               "total": r["total"], "chips": r["chips"], "log": r["log"]},
+                              default=str))
+    return f"{season} {label}: {r['total']} pts ({r['chips'] or 'no wildcard'}, {time.time() - t0:.0f}s)"
+
+
+def cmd_policy(a):
+    """Full seasons under each wildcard rule: the rank rule at several shares, and
+    the gap rule at several bars."""
+    seasons = a.seasons.split(",") if a.seasons else SEASONS
+    for s in seasons:
+        B.download(s)
+        projector_for(s)
+    pct = E.DEFAULTS["CHIP_TOP_PCT"]
+    policies = [(f"rank{x:.2f}", {"CHIP_TOP_PCT": dict(pct, wildcard=x)})
+                for x in [float(v) for v in a.ranks.split(",")]]
+    policies += [(f"gap{g:g}", {"WILDCARD_GAP": g}) for g in [float(v) for v in a.gaps.split(",")]]
+    jobs = [(s, label, over) for s in seasons for label, over in policies]
+    print(f"{len(jobs)} full-season runs across {a.workers} workers\n", flush=True)
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        for msg in ex.map(policy_one, jobs):
+            print(msg, flush=True)
+    print(f"\n  {'policy':<12}" + "".join(f"{s:>10}" for s in seasons) + f"{'mean':>9}   wildcards")
+    for label, _ in policies:
+        rs = [POLICY_DIR / f"{s}_{label}.json" for s in seasons]
+        rs = [json.loads(p.read_text()) if p.exists() else None for p in rs]
+        tot = [r["total"] for r in rs if r]
+        print(f"  {label:<12}" + "".join(f"{r['total'] if r else '-':>10}" for r in rs)
+              + (f"{statistics.mean(tot):>9.0f}" if tot else "")
+              + "   " + "; ".join(f"{r['season'][-5:]} {r['chips'] or '-'}" for r in rs if r))
 
 
 def load_records():
@@ -146,5 +289,17 @@ if __name__ == "__main__":
     t = sub.add_parser("tune")
     t.add_argument("--grid")
     t.set_defaults(func=cmd_tune)
+    g = sub.add_parser("gaps")
+    g.set_defaults(func=cmd_gaps)
+    pol = sub.add_parser("policy")
+    pol.add_argument("--seasons")
+    pol.add_argument("--ranks", default="0.05,0.15,0.30")
+    pol.add_argument("--gaps", default="5,10,15,20")
+    pol.add_argument("--workers", type=int, default=os.cpu_count())
+    pol.set_defaults(func=cmd_policy)
+    w = sub.add_parser("wildcard")
+    w.add_argument("--seasons")
+    w.add_argument("--workers", type=int, default=os.cpu_count())
+    w.set_defaults(func=cmd_wildcard)
     a = p.parse_args()
     a.func(a)

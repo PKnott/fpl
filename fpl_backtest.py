@@ -291,6 +291,13 @@ def record_week(source, proj, bs, pos, chips, forecast, squad, lu, gw_pts, t, cf
     # payoff can't be recovered from a table and is priced by full simulation
     # instead - and valuing it costs a whole multi-week planner solve per candidate
     # week, which dominated the recording cost for a column of None.
+    if "wildcard" in chips and t in forecast:
+        # The wildcard can't be replayed, but its signal can be logged: what a
+        # rebuild would add this week. One planner solve, not the whole window.
+        wc_stop = E.chip_window(bs, "wildcard", t)
+        out["wildcard"] = {"gap": round(float(E.chip_value("wildcard", t, proj, forecast[t],
+                                                           cfg, fh_cache, window_stop=wc_stop)), 3),
+                           "stop": int(wc_stop or 0)}
     for c in chips:
         if c == "wildcard":
             continue
@@ -365,13 +372,26 @@ def simulate(projector, cfg, label="", start=None, last_gw=38, verbose=False,
         # the wildcard so the squad trajectory does not depend on the very
         # decisions being tuned.
         allowed = [c for c in chips if c in cfg.get("PLAYABLE_CHIPS", E.CHIP_NAMES)]
+        # FORCE_WILDCARD = {window stop: gameweek, or None for never}. In a listed
+        # window the timing rule is switched off and the wildcard goes in that
+        # week, which measures what each week would really have paid.
+        forced = cfg.get("FORCE_WILDCARD") or {}
+        wc_stop = E.chip_window(bs, "wildcard", t)
+        force_now, wc_ahead = False, None
+        if wc_stop in forced:
+            allowed = [c for c in allowed if c != "wildcard"]
+            force_now = "wildcard" in chips and forced[wc_stop] == t
+            # Plan the weeks before it knowing it is coming, as a manager would.
+            if "wildcard" in chips and forced[wc_stop] and forced[wc_stop] > t:
+                wc_ahead = forced[wc_stop] - t
         forecast = None
-        if chips:
+        if allowed or (record_chips and chips):
             until = E.forecast_horizon(bs, proj.gws, chips)
             forecast = E.forecast_squads(proj, squad, bank, sell, cfg, until, plan_gws)
 
         d = E.decide_week(proj, plan_gws, bs, squad, bank, sell, cfg, allowed,
-                          forecast=forecast, fh_cache=fh_cache)
+                          forecast=forecast, fh_cache=fh_cache, force_wildcard=force_now,
+                          wc_ahead=wc_ahead)
         chip = d.chip
         if chip:
             used.add((chip, E.chip_window(bs, chip, t)))
