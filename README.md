@@ -16,27 +16,24 @@ _ref_current/               the pre-refactor code, kept only as a reference
 
 ## Where things live
 
-The repo sits in iCloud Desktop, but three things do **not**. They are symlinked
-in from `~/FPL-work`:
+The repo lives in `~/Developer/fpl`, outside iCloud: iCloud evicts files it
+considers idle, which breaks Python binaries. Three directories sit inside it but
+are gitignored, so the repo itself is about 20MB:
 
-| | why it stays out of iCloud |
+| | |
 |---|---|
-| `.venv` | iCloud evicts files it considers idle, which breaks Python binaries |
+| `.venv` | the Python environment |
 | `bt_cache` | ~500MB of regenerable pickles and records |
 | `bt_data` | archive CSVs, re-downloadable any time |
 
-All three are gitignored, so the repo itself is about 20MB. To rebuild them on a
-fresh machine:
+To rebuild the venv on a fresh machine:
 
 ```bash
-mkdir -p ~/FPL-work && cd ~/FPL-work
 python3 -m venv .venv
-.venv/bin/pip install pandas numpy pulp scipy requests
-cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Desktop/FPL"
-ln -s ~/FPL-work/.venv .venv
-ln -s ~/FPL-work/bt_cache bt_cache
-ln -s ~/FPL-work/bt_data bt_data
+.venv/bin/pip install pandas numpy "pulp==3.3.2" scipy requests pyarrow ipykernel jupyter
 ```
+
+PuLP is pinned because 4.0 no longer bundles the CBC solver the engine calls.
 
 Both notebooks download `fpl_engine.py` from this repo, so what the backtest tunes
 is what runs on a Saturday. Previously each notebook carried its own copy; the
@@ -77,7 +74,7 @@ each future week, stepped forward one planner solve at a time.
 ## Running things
 
 ```bash
-python -m venv .venv && .venv/bin/pip install pandas numpy pulp scipy requests
+python3 -m venv .venv && .venv/bin/pip install pandas numpy "pulp==3.3.2" scipy requests pyarrow
 .venv/bin/python run_backtest.py record --squads 5 --workers 8   # ~10 min per run
 .venv/bin/python run_backtest.py tune                            # seconds
 ```

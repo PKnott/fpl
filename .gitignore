@@ -1,8 +1,8 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
-bt_data/
-bt_cache/
+bt_data
+bt_cache
 *.pkl
 proj_cache_*
 .ipynb_checkpoints/
