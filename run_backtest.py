@@ -5,7 +5,7 @@
   python run_backtest.py wildcard [--seasons 2023-24,...]
   python run_backtest.py gaps
   python run_backtest.py bars [--chip bboost] [--bars 4,6,8,...]
-  python run_backtest.py policy [--ranks 0.05,0.15,0.30] [--gaps 5,10,15,20]
+  python run_backtest.py policy [--ranks 0.05,0.15,0.30] [--gaps 15,20,25,30] [--squads 0,1]
 
 `record` runs one full season per (season, starting squad) with only the wildcard
 playable, saving every chip's opportunity table and what that chip really paid in
@@ -68,7 +68,7 @@ def record_one(args):
     r = B.simulate(projector, cfg, f"{season}/sq{squad_ix}",
                    start=list(squads[squad_ix]), last_gw=last_gw, record_chips=True)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"season": season, "squad": squad_ix, "total": r["total"],
+    out.write_text(json.dumps({"season": season, "squad": squad_ix, "total": int(r["total"]),
                                "chips": r["chips"], "log": r["log"],
                                "tables": r["chip_tables"]}, default=str))
     return (f"{season} squad {squad_ix}: {r['total']} pts, wildcards {r['chips']}, "
@@ -111,7 +111,7 @@ def wildcard_one(args):
     t0 = time.time()
     r = B.simulate(projector, cfg, f"{season}/wc{gw}", start=list(start))
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"season": season, "stop": stop, "gw": gw, "total": r["total"],
+    out.write_text(json.dumps({"season": season, "stop": stop, "gw": gw, "total": int(r["total"]),
                                "chips": r["chips"], "log": r["log"]}, default=str))
     return (f"{season} half to GW{stop}, wildcard GW{gw or '-'}: {r['total']} pts "
             f"({r['chips'] or 'no wildcard'}, {time.time() - t0:.0f}s)")
@@ -133,11 +133,11 @@ def cmd_wildcard(a):
 
 
 def wildcard_report(seasons):
-    """Season totals by forced week, next to what the timing rule did (squad 0)."""
+    """Season totals by forced week, next to the same squad with no wildcard at all."""
     rule = {}
     for rec in load_records():
         if rec["squad"] == 0:
-            rule[rec["season"]] = (rec["total"], rec["chips"])
+            rule[rec["season"]] = (int(rec["total"]), rec["chips"])
     for stop, weeks in WILDCARD_WEEKS.items():
         print(f"\nWildcard in the half ending GW{stop} (other half left to the rule)")
         print(f"  {'week':>6}" + "".join(f"{s:>10}" for s in seasons) + f"{'mean':>9}")
@@ -145,13 +145,16 @@ def wildcard_report(seasons):
             cells = []
             for s in seasons:
                 p = WILDCARD_DIR / f"{s}_stop{stop}_gw{gw or 'none'}.json"
-                cells.append(json.loads(p.read_text())["total"] if p.exists() else None)
+                # int(): files written before the cast hold the total as a string
+                cells.append(int(json.loads(p.read_text())["total"]) if p.exists() else None)
             got = [c for c in cells if c is not None]
             mean = f"{statistics.mean(got):>9.0f}" if got else f"{'':>9}"
             print(f"  {gw or 'none':>6}" + "".join(f"{c if c is not None else '-':>10}"
                                                  for c in cells) + mean)
-        print(f"  {'rule':>6}" + "".join(f"{rule.get(s, ('-',))[0]:>10}" for s in seasons)
-              + "   " + "; ".join(f"{s}: {rule[s][1]}" for s in seasons if s in rule))
+        # The recordings play no chips, so this is the floor: no wildcard in
+        # either half. The rule's own choice shows up as the row where the forced
+        # week matches what the rule plays in the other table.
+        print(f"  {'no wc':>6}" + "".join(f"{rule.get(s, ('-',))[0]:>10}" for s in seasons))
 
 
 def cmd_bars(a):
@@ -206,20 +209,21 @@ POLICY_DIR = ROOT / "bt_cache" / "policy"
 
 
 def policy_one(args):
-    season, label, over = args
-    out = POLICY_DIR / f"{season}_{label}.json"
+    season, label, over, squad_ix = args
+    sq = f"_sq{squad_ix}" if squad_ix else ""     # squad 0 keeps its original name
+    out = POLICY_DIR / f"{season}_{label}{sq}.json"
     if out.exists():
         return f"{season} {label}: already run, skipping"
     cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"], **over)
     projector = projector_for(season)
-    start = B.starting_squads(projector, cfg, n=1)[0]
+    start = B.starting_squads(projector, cfg, n=squad_ix + 1)[squad_ix]
     t0 = time.time()
-    r = B.simulate(projector, cfg, f"{season}/{label}", start=list(start))
+    r = B.simulate(projector, cfg, f"{season}/{label}{sq}", start=list(start))
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"season": season, "label": label, "over": over,
-                               "total": r["total"], "chips": r["chips"], "log": r["log"]},
+    out.write_text(json.dumps({"season": season, "label": label, "over": over, "squad": squad_ix,
+                               "total": int(r["total"]), "chips": r["chips"], "log": r["log"]},
                               default=str))
-    return f"{season} {label}: {r['total']} pts ({r['chips'] or 'no wildcard'}, {time.time() - t0:.0f}s)"
+    return f"{season} {label}{sq}: {r['total']} pts ({r['chips'] or 'no wildcard'}, {time.time() - t0:.0f}s)"
 
 
 def cmd_policy(a):
@@ -230,22 +234,27 @@ def cmd_policy(a):
         B.download(s)
         projector_for(s)
     pct = E.DEFAULTS["CHIP_TOP_PCT"]
-    policies = [(f"rank{x:.2f}", {"CHIP_TOP_PCT": dict(pct, wildcard=x)})
+    # WILDCARD_GAP=None, or the default bar would override the rank rule
+    policies = [(f"rank{x:.2f}", {"CHIP_TOP_PCT": dict(pct, wildcard=x), "WILDCARD_GAP": None})
                 for x in [float(v) for v in a.ranks.split(",")]]
     policies += [(f"gap{g:g}", {"WILDCARD_GAP": g}) for g in [float(v) for v in a.gaps.split(",")]]
-    jobs = [(s, label, over) for s in seasons for label, over in policies]
+    squads = [int(v) for v in a.squads.split(",")]
+    jobs = [(s, label, over, q) for s in seasons for q in squads for label, over in policies]
     print(f"{len(jobs)} full-season runs across {a.workers} workers\n", flush=True)
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
         for msg in ex.map(policy_one, jobs):
             print(msg, flush=True)
-    print(f"\n  {'policy':<12}" + "".join(f"{s:>10}" for s in seasons) + f"{'mean':>9}   wildcards")
-    for label, _ in policies:
-        rs = [POLICY_DIR / f"{s}_{label}.json" for s in seasons]
-        rs = [json.loads(p.read_text()) if p.exists() else None for p in rs]
-        tot = [r["total"] for r in rs if r]
-        print(f"  {label:<12}" + "".join(f"{r['total'] if r else '-':>10}" for r in rs)
-              + (f"{statistics.mean(tot):>9.0f}" if tot else "")
-              + "   " + "; ".join(f"{r['season'][-5:]} {r['chips'] or '-'}" for r in rs if r))
+    for q in squads:
+        sq = f"_sq{q}" if q else ""
+        print(f"\n  starting squad {q}")
+        print(f"  {'policy':<12}" + "".join(f"{s:>10}" for s in seasons) + f"{'mean':>9}   wildcards")
+        for label, _ in policies:
+            rs = [POLICY_DIR / f"{s}_{label}{sq}.json" for s in seasons]
+            rs = [json.loads(p.read_text()) if p.exists() else None for p in rs]
+            tot = [int(r["total"]) for r in rs if r]
+            print(f"  {label:<12}" + "".join(f"{int(r['total']) if r else '-':>10}" for r in rs)
+                  + (f"{statistics.mean(tot):>9.0f}" if tot else "")
+                  + "   " + "; ".join(f"{r['season'][-5:]} {r['chips'] or '-'}" for r in rs if r))
 
 
 def load_records():
@@ -326,6 +335,7 @@ if __name__ == "__main__":
     pol.add_argument("--seasons")
     pol.add_argument("--ranks", default="0.05,0.15,0.30")
     pol.add_argument("--gaps", default="5,10,15,20")
+    pol.add_argument("--squads", default="0", help="starting squads, e.g. 0,1,2,3,4")
     pol.add_argument("--workers", type=int, default=os.cpu_count())
     pol.set_defaults(func=cmd_policy)
     w = sub.add_parser("wildcard")

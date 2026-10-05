@@ -142,6 +142,13 @@ DEFAULTS = {
     # certainty in the last week, so no absolute point minimums are needed.
     # Backtest-tuned per chip.
     "CHIP_TOP_PCT": {"3xc": 0.15, "bboost": 0.40, "freehit": 0.05, "wildcard": 0.15},
+    # The wildcard uses a bar instead: play once a rebuild beats the best normal
+    # transfers by this much (planner points - roughly 5 pts/week of squad
+    # quality), or in its window's last week. The top-x% rule ranked this week
+    # against a forecast that assumes no bad news, so it always chose the first
+    # week of each window (GW2 and GW20) whatever x was. Backtest: 20 beat it in
+    # all three seasons, +58 pts/season. None = back to the top-x% rule.
+    "WILDCARD_GAP": 20,
 
     # ---- solver ----
     "SOLVER_SECONDS": 60,           # time limit per optimisation

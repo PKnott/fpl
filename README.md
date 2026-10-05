@@ -1,7 +1,7 @@
 # FPL decision engine
 
 An end-to-end decision system for Fantasy Premier League. It projects every
-player's points for the next 24 gameweeks, plans transfers several weeks ahead
+player's points to the end of the season, plans transfers several weeks ahead
 with integer programming, picks the lineup and captain using Monte Carlo
 simulation that allows for autosubs, and decides when to play each chip.
 
@@ -12,8 +12,8 @@ The same engine runs in two places:
   each deadline, so I can measure and tune decisions against what actually happened.
 
 **Stack:** Python · pandas · NumPy · PuLP/CBC (mixed-integer programming) ·
-Jupyter. About 2,400 lines across the engine, the backtest harness and the
-verification tools.
+Jupyter. About 3,000 lines across the engine, the backtest harness and the
+analysis and verification tools.
 
 ---
 
@@ -23,14 +23,14 @@ An excerpt from a live weekly report (GW6, 2026-27):
 
 ```
  CHIPS  (compared across every week of each chip's window)
-  Bench Boost: +9.4 now, this week #13 of 14 remaining (top 93%, playing if in top 21%)
-               -> save - best remaining week is GW17 (+17.1)
+  Bench Boost: +8.6 now, this week #11 of 14 remaining (top 79%, playing if in top 43%)
+               -> save - best remaining week is GW19 (+16.8)
 
  TRANSFERS
  0 transfer(s): +0.0 pts vs rolling
- 1 transfer(s): +3.8 pts vs rolling
+ 1 transfer(s): +3.2 pts vs rolling
    OUT Gakpo (LIV, £7.2m)               IN Mbeumo (MUN, £7.9m)
- 2 transfer(s)  (-6 hit): +2.9 pts vs rolling
+ 2 transfer(s)  (-6 hit): +1.7 pts vs rolling
  ...
 >>> RECOMMENDED: 1 transfer(s)
 
@@ -41,9 +41,8 @@ An excerpt from a live weekly report (GW6, 2026-27):
 
  STARTING XI - GW6                 xP  If plays  Plays
   MID Mbeumo (C)                  5.8       5.8   100%
-  FWD João Pedro                  2.3       5.4    42%
+  DEF Konsa                       2.8       3.9    71%
   ...
-  Projected GW6 score (including autosubs): 56.4
 ```
 
 The report also covers:
@@ -70,16 +69,17 @@ component at a time:
   bonus (10+ or 12+ actions) is a Poisson threshold too.
 - **Attacking output blends xG with actual goals** (85/15, a setting tuned by
   backtest). Raw output alone overreacts to finishing luck.
-- **Small samples are pulled towards a prior.** Every per-90 rate is weighted
-  together with last season's rate and the position average, each counted as a
-  fixed number of minutes. A player with 90 minutes is mostly prior; one with
-  1,500 is mostly himself. Goalkeepers get a stronger prior, because saves and
-  bonus are very noisy.
+- **Small samples are pulled towards a prior.** Every per-90 rate is a
+  minutes-weighted blend of this season, last season and the position average.
+  How much weight the past gets is set **per stat**, from measurement (see
+  [When does form become signal?](#when-does-form-become-signal)): xG settles fast,
+  while goals, assists, bonus and cards are mostly luck over a few weeks and
+  lean much harder on last season.
 - **Minutes use recency weighting.** Recent games are weighted with exponential
   decay (0.6 per game back, also tuned by backtest). This gives each player's
-  chances of starting, of playing 60+ minutes and of appearing at all. The
-  official injury flags (live) or a recent-absence rule (backtest) then scale those
-  chances.
+  chances of starting, of playing 60+ minutes and of appearing at all. Before a
+  player's first game, last season's starts stand in. The official injury flags
+  (live) or a recent-absence rule (backtest) then scale those chances.
 - **Team strength starts from FPL's pre-season rating**, and that rating counts
   for less as real games come in.
 - **Busy keepers make a defence look leakier.** A keeper facing a lot of shots is
@@ -98,9 +98,10 @@ The model enforces:
 - free-transfer roll-over, plus a cost for each extra transfer. FPL charges 4
   points; the planner charges 6, as a margin against projection noise.
 
-The objective is the discounted expected points of the XI. On top of that it adds
-a weighted "tail" for 19 weeks of longer-term squad value, the expected value of
-price changes, and a value for each free transfer left at the end of the horizon.
+The objective is the discounted expected points of the XI (each week counts 0.8
+of the one before). On top of that it adds a half-weight "tail" out to 19 weeks
+for longer-term squad value, the expected value of price changes, and a value for
+each free transfer left at the end of the horizon.
 
 The report shows the best plan for each number of transfers this week, from 0 to
 11. Only the first week is acted on, and the plan is re-solved every week.
@@ -123,15 +124,26 @@ across 200 samples is an exact tie broken the other way.
 
 ### 4. Chip timing
 
-A chip is worth nothing if it's never used, so the right question isn't "is this
-week good?" It is "is this week good enough, given how many chances are left?"
+FPL gives one of each chip per half-season (GW1–19 and GW20–38), and an unused
+chip expires. So the question isn't "is this week good?" but "is this week good
+enough, given the chances left?" Two rules answer it:
 
-- Each chip is valued in **every remaining week of its window**. Each week's value
-  is measured against a **forecast of the squad I'd actually own then**: the
-  planner steps forward one week at a time and keeps only its first week's moves.
-- This week is ranked among those weeks. The chip is played if it lands in the top
-  `CHIP_TOP_PCT` share. The bar tightens by itself as the window runs out and
-  reaches certainty in the last week, so no hand-set point thresholds are needed.
+- **Triple Captain, Bench Boost and Free Hit: rank against the rest of the window.**
+  Each is valued in every remaining week of its window, against a forecast of the
+  squad I'd actually own then (the planner stepped forward one week at a time).
+  The chip is played if this week ranks in the top `CHIP_TOP_PCT` share of what's
+  left. The bar tightens by itself as the window runs out, and the chip is always
+  played in its last week rather than wasted.
+- **Wildcard: play when the squad has fallen far enough behind.** Each week the
+  planner solves two plans: rebuild freely now, or carry on with normal transfers.
+  The wildcard is played once the rebuild is ahead by `WILDCARD_GAP` (20 planner
+  points — roughly 5 points a week of squad quality). A first-half wildcard is
+  only credited up to GW19, because from GW20 a fresh one can rebuild anyway.
+
+  The wildcard used the ranking rule until the backtest showed it was broken: the
+  forecast assumes no injuries or form swings, so it always makes "now" look like
+  the best time to rebuild. It played GW2 and GW20 in every season, at every
+  threshold. See [the wildcard results](#the-wildcard).
 - If two chips qualify in the same week, the one that loses most by waiting is
   played.
 
@@ -146,66 +158,148 @@ been made on the day. The simulator then applies the engine's decisions and
 scores what really happened. It calls `decide_week`, the same function the live
 report uses, so the backtest tests the program that actually runs.
 
-**Tuning chips by recording and replaying.** Sweeping a chip threshold by
-re-simulating whole seasons would cost hours per setting. Instead:
+Three seasons are replayed (2023-24 to 2025-26), from five different starting
+squads each.
 
-1. **Record:** simulate each (season × starting squad) once, with only the
-   wildcard playable. For every week, save each chip's full opportunity table and
-   what playing it there would *really* have scored.
-2. **Replay:** for each candidate threshold, walk those saved tables. This takes
-   seconds for the whole grid.
+**Chips that don't change the squad are tuned by record and replay.** Re-simulating
+a season for every candidate threshold would take hours per setting. Instead:
+
+1. **Record:** simulate each (season × starting squad) once, playing no chips. For
+   every week, save each chip's full opportunity table, what playing it there
+   would *really* have scored, and the wildcard gap.
+2. **Replay:** for each candidate rule, walk those saved tables. A whole grid
+   takes seconds.
 
 This is valid because Triple Captain and Bench Boost never change the squad, and
 Free Hit changes it for one week only, so their payoffs don't depend on when they
-were played. The wildcard does change the squad's path and is left out of the
-replay. Every threshold is compared on the same seasons and squads (a paired
-comparison), and results are reported with standard errors and broken down by
-season.
+were played. Every rule is compared on the same seasons and squads (a paired
+comparison), with standard errors and a per-season breakdown.
 
-### Results
+**The wildcard needs full simulations**, because it changes every week after it.
+Two experiments:
 
-There are 15 recorded seasons: 3 seasons × 5 starting squads, with only the
-wildcard playable. Points are season totals before Triple Captain, Bench Boost
-and Free Hit are added:
-
-| Season | Season total (5 squads) | Wildcards played |
-|---|---|---|
-| 2023-24 | 2,245 – 2,249 | GW2, GW22 |
-| 2024-25 | 2,236 – 2,245 | GW2, GW20 |
-| 2025-26 | 2,025 – 2,068 | GW2, GW20 |
-
-The next table shows the real points each chip added per season (both halves
-combined) under different thresholds, replayed from those records. A threshold
-`x` means "play when this week ranks in the top `x` share of the weeks left".
-At `x = 0` only the single best remaining week qualifies.
-
-| Chip | Best threshold | Points per season | At a loose threshold (0.30) |
-|---|---|---|---|
-| Triple Captain | 0.10 – 0.25 (flat) | 28.7 | 19.7 |
-| Bench Boost | 0.00 – 0.25 (flat) | 23.9 | 19.7 |
-| Free Hit | 0.00 – 0.05 | 27.7 | −10.7 |
-
-What this shows:
-
-- **Free Hit is the chip that rewards patience.** Holding it for the single best
-  week earned about 28 points per season. Loosening the threshold to 0.15 cut
-  that to about 1, and in two of the three seasons it lost points outright. The
-  pattern holds in every season, so the Free Hit threshold is tightened to 0.05.
-- **Triple Captain and Bench Boost are flat between 0.10 and 0.25.** The existing
-  0.15 already sits in that range, so they are unchanged.
-- **The samples are fewer than they look.** Every run plays its wildcard in GW2,
-  which rebuilds the squad, so the five starting squads for a season end up
-  nearly identical. The 15 runs are closer to 3 independent ones, one per season,
-  and the standard errors in `run_backtest.py tune` overstate the precision.
-  That's why thresholds only change when the effect is consistent across all
-  three seasons, and why values are rounded rather than set to the exact
-  grid-optimal number.
-- **Final fixture lists flatter waiting**, as described under the limitations
-  below. Free Hit is the most exposed, because blank gameweeks show up in the
-  archive earlier than they did at the time. That's a reason to use 0.05 rather
-  than 0.
+- **Forced week:** play it in a chosen week (every third week of each half, plus
+  never), with the other half left to the rule. The planner is told in advance,
+  so it doesn't take hits the week before a rebuild.
+- **Rule comparison:** full seasons under each candidate rule.
 
 ---
+
+## Results
+
+### Chip thresholds
+
+Real points each chip added per season, replayed from 15 recorded seasons:
+
+| Chip | Rule | Points per season | Notes |
+|---|---|---|---|
+| Free Hit | top 5% | 28.7 | At 0.15, two of three seasons lost points with it. |
+| Triple Captain | top 15% | 27.7 | Anywhere from 0.10 to 0.25 is as good; the differences come down to one or two captains. Looser than 0.30 drops to 11. |
+| Bench Boost | top 40% | 24.3 | At 0.15 it was nearly always played in the last week or two of its window, because the forecast always makes the bench look stronger later. 0.40 beat 0.15 in all three seasons. |
+
+A fixed points bar ("play when worth at least N") did worse than the ranking rule
+for all three chips (`run_backtest.py bars`).
+
+### The wildcard
+
+**No single week is reliably best.** Season totals with the first-half wildcard
+forced into each week:
+
+| Week | 2023-24 | 2024-25 | 2025-26 | Mean |
+|---|---|---|---|---|
+| Never | 2,258 | 2,376 | 2,059 | 2,231 |
+| GW2 | **2,300** | 2,291 | 2,109 | 2,233 |
+| GW5 | 2,247 | 2,145 | 2,069 | 2,154 |
+| GW8 | 2,250 | 2,364 | **2,177** | 2,264 |
+| GW11 | 2,278 | 2,336 | 2,083 | 2,232 |
+| GW14 | 2,256 | **2,402** | 1,988 | 2,215 |
+| GW17 | 2,272 | 2,355 | 1,991 | 2,206 |
+
+Each season names a different best week, and one wildcard can move a season by
+over 250 points, because it sends everything after it down a different path. In
+the second half, GW20 had the lowest average of any option, below never playing
+it at all.
+
+**A signal beats the calendar.** Full seasons under each rule (starting squad 0):
+
+| Rule | 2023-24 | 2024-25 | 2025-26 | Mean | Wildcards played |
+|---|---|---|---|---|---|
+| Rank against the window (any threshold) | 2,300 | 2,291 | 2,109 | 2,233 | GW2 and GW20, every time |
+| Gap ≥ 15 | 2,300 | 2,266 | 2,155 | 2,240 | |
+| **Gap ≥ 20** | **2,383** | **2,314** | **2,178** | **2,292** | GW2–4, then GW23–33 |
+| Gap ≥ 25 | 2,353 | 2,250 | 2,154 | 2,252 | |
+| Gap ≥ 30 | 2,330 | 2,353 | 2,086 | 2,256 | often only fires once |
+
+Gap ≥ 20 beat the old rule in all three seasons, by about 58 points a season. It
+still rebuilds early, when the pre-season squad really is out of date, but holds
+the second wildcard until the squad has actually drifted.
+
+**It holds on the other starting squads.** Gap ≥ 20 against the old rule, all
+five starting squads:
+
+| Season | Gap 20 minus old rule, squads 0–4 | Mean |
+|---|---|---|
+| 2023-24 | +83, +85, +41, +55, +2 | +53 |
+| 2024-25 | +23 ×5 (the early rebuild makes the squads identical) | +23 |
+| 2025-26 | +69, +32, +67, −35, +70 | +41 |
+
+It won 14 of 15 runs, by about **39 points a season** on average.
+
+One caution: 20 was chosen from four bars on squad 0's seasons, which flatters
+that table's margin. The other four squads weren't used to choose it, and the
+gain there (+34 a season) is close to the overall figure. What makes it credible
+is that it won in every season, on almost every squad, and the mechanism is
+understood.
+
+### When does form become signal?
+
+`signal_noise.py` asks the archive directly. For each stat, at every week of
+three seasons, it finds the weights for last season and the position average
+that best predict that stat over the **rest** of the season, scored on held-out
+seasons:
+
+| Stat | Last-season weight (minutes) | Own data counts for half after | Error vs one shared weight |
+|---|---|---|---|
+| xG, xA | 720 (the default 540 kept: no measurable gain) | ~900 min (10 games) | about the same |
+| Goals, assists | 2,700 | ~3,600–4,000 min | −22 to −25% |
+| Bonus (outfield) | 1,800 | ~2,700 min | −23% |
+| Yellow cards | 2,700 | ~4,000 min | −38% |
+| Saves (GK) | 900 | ~1,000 min | −13% |
+
+xG settles within about ten games; a player's goal or bonus tally over a few
+weeks is mostly luck, and last season predicts the rest of this one better. The
+fitted weights are in `DEFAULTS` as `STAT_PRIOR_MINUTES`.
+
+The effect on **points** is small but consistent: six-week projection error falls
+0.2–0.7% in every season (`projection_accuracy.py`). Points are driven mostly by
+xG and minutes, which were already well calibrated, so the noisy stats only move
+the margins.
+
+### Season totals
+
+With no chips at all, the engine scores 2,249–2,302 (2023-24), 2,342–2,400
+(2024-25) and 2,002–2,038 (2025-26) across the five starting squads.
+
+---
+
+## What the backtest caught
+
+Running the backtest end to end found problems that no single piece of code
+showed on its own:
+
+- **Every player projected zero at GW1.** The minutes model learns from this
+  season's games, and before GW1 there are none, so the opening squad was
+  effectively random and a GW2 wildcard replaced 14 of 15 players. Last season's
+  starts now stand in until a player has played.
+- **Later wildcard weeks lost by construction.** Projections stopped 24 weeks out,
+  so a GW17 wildcard seen from GW2 was credited with 9 weeks of benefit and a GW3
+  one with 19. Projections now run to the end of the season.
+- **The forecast assumes no news.** Valuing future weeks from today's projections
+  means nothing ever goes wrong in the future, so "now" always looks best for a
+  wildcard and "later" always looks best for a Bench Boost. That is why the
+  wildcard moved to a gap rule and the Bench Boost to a looser threshold.
+- **A planner that didn't know a wildcard was coming** took four hits the week
+  before a forced rebuild. Forced weeks are now planned in advance.
 
 ## Engineering notes
 
@@ -225,9 +319,10 @@ What this shows:
   2025-26 reference season moved from 2,022 to 2,030 points
   (`reference/baseline.md`). The old behaviour can still be reproduced with a
   config flag.
-- **Caching.** All 38 gameweeks of projections for a season are cached to disk,
-  keyed by a hash of the projection settings. Recording runs in parallel across
-  processes, and finished runs are skipped when a recording is resumed.
+- **Caching and resumable runs.** All 38 gameweeks of projections for a season
+  are cached to disk, keyed by a hash of the projection settings, and shared by
+  every experiment. Simulations run in parallel across processes; each finished
+  run is saved, so an interrupted experiment resumes where it stopped.
 
 ## Known limitations
 
@@ -261,8 +356,19 @@ PuLP is pinned because 4.0 no longer includes the CBC solver.
 **Backtest:**
 
 ```bash
-.venv/bin/python run_backtest.py record --squads 5 --workers 4   # ~10 min per run, cached
-.venv/bin/python run_backtest.py tune                            # seconds
+.venv/bin/python run_backtest.py record --squads 5 --workers 4   # 15 seasons, ~10 min each
+.venv/bin/python run_backtest.py tune                            # chip thresholds, seconds
+.venv/bin/python run_backtest.py bars --chip bboost              # points-bar rule, seconds
+.venv/bin/python run_backtest.py gaps                            # wildcard gap by stage of season
+.venv/bin/python run_backtest.py wildcard --workers 4            # forced-week experiment
+.venv/bin/python run_backtest.py policy --gaps 15,20,25,30       # wildcard rule comparison
+```
+
+**Analysis:**
+
+```bash
+.venv/bin/python signal_noise.py          # per-stat weights for last season vs this season
+.venv/bin/python projection_accuracy.py   # projected vs actual points, per config
 ```
 
 **Verification:**
@@ -277,7 +383,9 @@ PuLP is pinned because 4.0 no longer includes the CBC solver.
 ```
 fpl_engine.py               projection model, planner, lineup, chips, weekly report
 fpl_backtest.py             archive data source, season simulator, chip record/replay
-run_backtest.py             command-line tool: record runs and tune chip thresholds
+run_backtest.py             command-line tool: record, tune and the wildcard experiments
+signal_noise.py             when a player's form becomes signal, per stat
+projection_accuracy.py      projected vs actual points for competing configs
 FPL_Weekly_Assistant.ipynb  the weekly report
 FPL_Backtest.ipynb          backtest and tuning walkthrough
 verify.py                   regression check against frozen reference outputs
