@@ -235,9 +235,14 @@ def cmd_policy(a):
         projector_for(s)
     pct = E.DEFAULTS["CHIP_TOP_PCT"]
     # WILDCARD_GAP=None, or the default bar would override the rank rule
-    policies = [(f"rank{x:.2f}", {"CHIP_TOP_PCT": dict(pct, wildcard=x), "WILDCARD_GAP": None})
-                for x in [float(v) for v in a.ranks.split(",")]]
-    policies += [(f"gap{g:g}", {"WILDCARD_GAP": g}) for g in [float(v) for v in a.gaps.split(",")]]
+    ranks = [float(v) for v in a.ranks.split(",") if v]
+    gaps = [float(v) for v in a.gaps.split(",") if v]
+    # --tag names a run of the current DEFAULTS, so results from an earlier
+    # engine aren't mistaken for it (files are skipped by name)
+    tag = f"_{a.tag}" if a.tag else ""
+    policies = [(f"rank{x:.2f}{tag}", {"CHIP_TOP_PCT": dict(pct, wildcard=x), "WILDCARD_GAP": None})
+                for x in ranks]
+    policies += [(f"gap{g:g}{tag}", {"WILDCARD_GAP": g}) for g in gaps]
     squads = [int(v) for v in a.squads.split(",")]
     jobs = [(s, label, over, q) for s in seasons for q in squads for label, over in policies]
     print(f"{len(jobs)} full-season runs across {a.workers} workers\n", flush=True)
@@ -336,6 +341,7 @@ if __name__ == "__main__":
     pol.add_argument("--ranks", default="0.05,0.15,0.30")
     pol.add_argument("--gaps", default="5,10,15,20")
     pol.add_argument("--squads", default="0", help="starting squads, e.g. 0,1,2,3,4")
+    pol.add_argument("--tag", default="", help="suffix for this engine version's results")
     pol.add_argument("--workers", type=int, default=os.cpu_count())
     pol.set_defaults(func=cmd_policy)
     w = sub.add_parser("wildcard")

@@ -1,6 +1,7 @@
 """Do projected points predict real points? Compare configs on every player-week.
 
-    python projection_accuracy.py
+    python projection_accuracy.py         # per-stat priors vs one shared weight
+    python projection_accuracy.py hit     # consistency (hit rate) strengths
 """
 import os, pathlib, sys
 import numpy as np
@@ -52,5 +53,9 @@ def compare(configs):
 
 if __name__ == "__main__":
     base = R.base_cfg(PLAYABLE_CHIPS=["wildcard"])
-    compare({"one weight for all": dict(base, STAT_PRIOR_MINUTES={}),
-             "per-stat (DEFAULTS)": base})
+    import sys as _sys
+    if _sys.argv[1:] == ["hit"]:
+        compare({f"hit rate {w}": dict(base, HIT_RATE_WEIGHT=w) for w in (0, 0.35, 0.5, 0.65)})
+    else:
+        compare({"one weight for all": dict(base, STAT_PRIOR_MINUTES={}),
+                 "per-stat (DEFAULTS)": base})

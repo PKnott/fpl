@@ -75,6 +75,10 @@ component at a time:
   [When does form become signal?](#when-does-form-become-signal)): xG settles fast,
   while goals, assists, bonus and cards are mostly luck over a few weeks and
   lean much harder on last season.
+- **Consistent returners get a small boost.** A player's projection is scaled by
+  how often he has returned (a goal or assist) compared with his position, so a
+  run of 2, 23, 2, 2, 2 counts for less than steady returns with the same average
+  (see [Consistency vs one big game](#consistency-vs-one-big-game)).
 - **Minutes use recency weighting.** Recent games are weighted with exponential
   decay (0.6 per game back, also tuned by backtest). This gives each player's
   chances of starting, of playing 60+ minutes and of appearing at all. Before a
@@ -276,6 +280,30 @@ The effect on **points** is small but consistent: six-week projection error fall
 xG and minutes, which were already well calibrated, so the noisy stats only move
 the margins.
 
+### Consistency vs one big game
+
+`consistency.py` asks whether a spike of one big game is signal or noise, using
+four seasons of match-by-match data:
+
+- **For points, consistency matters.** Scaling a player's points average by the
+  share of games he returned in beats the plain average in every season
+  (correlation with future points 0.37 → 0.44). Trimming his best game or using
+  the median game does worse.
+- **For xG and xA, the plain average is already about right.** Underlying chance
+  numbers are much less spiky than points.
+- **Scoring above xG is mostly luck**: only 10–15% carries into the next season,
+  against about 90% for xG itself. That supports the 85/15 xG/goals blend.
+  Assisting above xA carries over more (20–40%) but adds nothing on top of the
+  projection.
+
+Built into the engine (`HIT_RATE_WEIGHT`), the hit rate cuts six-week projection
+error by 0.8% and lifts correlation with actual points from 0.566 to 0.575, in
+every season (outfield players with 3+ games, scored after a straight-line
+rescale). In full-season backtests it averaged **+15 points a season**, but
+noisily: +48 in the one season where the wildcard weeks didn't move, and −11 and
++9 in the two where the change also shifted the second wildcard. It's on, as a
+modest and likely improvement rather than a proven one.
+
 ### Season totals
 
 With no chips at all, the engine scores 2,249–2,302 (2023-24), 2,342–2,400
@@ -299,6 +327,10 @@ showed on its own:
   means nothing ever goes wrong in the future, so "now" always looks best for a
   wildcard and "later" always looks best for a Bench Boost. That is why the
   wildcard moved to a gap rule and the Bench Boost to a looser threshold.
+- **The projections are over-confident.** Over six weeks, actual points ≈ 3.6 +
+  0.70 × projected: big projections overshoot and small ones undershoot. Rankings
+  are unaffected, but the size of any gain (a hit, a chip, a captain margin) is
+  overstated. This is the next thing to fix.
 - **A planner that didn't know a wildcard was coming** took four hits the week
   before a forced rebuild. Forced weeks are now planned in advance.
 
@@ -376,6 +408,8 @@ PuLP is pinned because 4.0 no longer includes the CBC solver.
 ```bash
 .venv/bin/python signal_noise.py          # per-stat weights for last season vs this season
 .venv/bin/python projection_accuracy.py   # projected vs actual points, per config
+.venv/bin/python consistency.py           # one big game vs consistent returns; finishing skill
+.venv/bin/python consistency.py engine    # does consistency add to the engine's projections?
 ```
 
 **Verification:**
@@ -393,6 +427,7 @@ fpl_backtest.py             archive data source, season simulator, chip record/r
 run_backtest.py             command-line tool: record, tune and the wildcard experiments
 signal_noise.py             when a player's form becomes signal, per stat
 projection_accuracy.py      projected vs actual points for competing configs
+consistency.py              consistent performers vs one big game; is finishing a skill
 FPL_Weekly_Assistant.ipynb  the weekly report
 FPL_Backtest.ipynb          backtest and tuning walkthrough
 verify.py                   regression check against frozen reference outputs

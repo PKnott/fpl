@@ -115,6 +115,17 @@ DEFAULTS = {
         "bonus|OUT": [1800, 900], "bonus|GK": [5400, 6750],
         "saves": [900, 90], "yellow_cards": [2700, 1350],
     },
+    # Consistency: scale an outfield player's projection by how often he returns
+    # (a goal or assist) compared with his position, once he has played
+    # HIT_MIN_GAMES. Players who return regularly beat their projection and
+    # one-big-game players fall short: with it on, six-week error falls 0.8% and
+    # correlation with actual points rises 0.566 -> 0.575, better in all three
+    # seasons (outfield players with 3+ games, GW4-25, scored after a straight-
+    # line rescale; consistency.py). Raw error rises, because the projections
+    # are already too spread out and this widens them. 0 = off.
+    "HIT_RATE_WEIGHT": 0.5,
+    "HIT_RATE_BASE": {2: 0.08, 3: 0.17, 4: 0.25},   # position averages, archive
+    "HIT_MIN_GAMES": 3,
     # Goalkeepers get their own steadying (saves & bonus are very noisy).
     # None = use PRIOR_MINUTES like everyone else.
     "GK_PRIOR_MINUTES": 360,
@@ -313,7 +324,9 @@ def fetch_player_pages(ids):
             d = fetch(f"element-summary/{pid}/")
             past = d.get("history_past", [])
             games = sorted(d.get("history", []), key=lambda g: (g.get("round", 0), g.get("kickoff_time", "")))
-            recent = [{"minutes": g.get("minutes", 0), "starts": g.get("starts", 0)} for g in games]
+            recent = [{"minutes": g.get("minutes", 0), "starts": g.get("starts", 0),
+                       "ret": int(g.get("goals_scored", 0) > 0 or g.get("assists", 0) > 0)}
+                      for g in games]
             return pid, (past[-1] if past else None), recent
         except Exception:
             return pid, None, None
@@ -322,6 +335,12 @@ def fetch_player_pages(ids):
     past = {pid: s for pid, s, _ in res if s and s.get("minutes", 0) >= 600}
     recent = {pid: r for pid, _, r in res if r}
     return past, recent
+
+
+def hit_record(games):
+    """(games played, games with a goal or assist) from a game-by-game record."""
+    played = [g for g in games if g.get("minutes", 0) > 0]
+    return len(played), sum(g.get("ret", 0) for g in played)
 
 
 # ---------------------------------------------------------------------
@@ -407,6 +426,9 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
         for gk in ((True,) if grp == "GK" else (False,) if grp == "OUT" else (True, False)):
             stat_w[(stat, gk)] = (v[0] if stats_on else 0, v[1])
     exact_saves = cfg.get("EXACT_SAVES", False)
+    hit_w = cfg.get("HIT_RATE_WEIGHT", 0) or 0
+    hit_base = {int(k): v for k, v in (cfg.get("HIT_RATE_BASE") or {}).items()}
+    hit_min = cfg.get("HIT_MIN_GAMES", 3)
     m_decay = cfg.get("MINUTES_DECAY")
     rows, breakdown = [], {}
     for e in bs["elements"]:
@@ -475,6 +497,13 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
         base_av = 0.0 if status == "u" else (1.0 if cop is None else cop / 100)
         ov = overrides.get(norm(e["web_name"]), {})
         pk = POS_KEY[pt]
+        hit_mult, hit_info = 1.0, None
+        played, returned = e.get("hit") or (0, 0)
+        if hit_w and pt in hit_base and played >= hit_min:
+            rate_ = returned / played
+            hit_mult = min(1.35, max(0.75, 1 + hit_w * (rate_ - hit_base[pt])))
+            hit_info = {"played": played, "returned": returned, "rate": rate_,
+                        "base": hit_base[pt], "mult": hit_mult}
         xp, gw_detail = {}, {}
         for i, gw in enumerate(gws):
             av = 0.0 if status == "u" else base_av + (1 - base_av) * min(1.0, i / 3)
@@ -503,14 +532,16 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
                                       "exp_conceded": lam_ag, "exp_saves": saves_mu,
                                       "own_def": ts["def"][t], "own_att": ts["att"][t],
                                       "opp_att": ts["att"][opp], "opp_def": ts["def"][opp]})
-            xp[gw] = round(av * sum(comp.values()), 2)
-            gw_detail[gw] = {"availability": av, "components": {k: av * v for k, v in comp.items()},
+            xp[gw] = round(av * hit_mult * sum(comp.values()), 2)
+            gw_detail[gw] = {"availability": av,
+                             "components": {k: av * hit_mult * v for k, v in comp.items()},
                              "fixtures": fixtures_info}
         breakdown[e["id"]] = {"pos": pt, "start_rate": start_rate, "starts": e.get("starts", 0),
                               "p60": p60, "p_any": p_any, "minutes_method": minutes_method,
                               "recent": [g["minutes"] for g in recent][::-1],
                               "team_games": n, "mpg": mpg, "rates": rate_info,
                               "last_season": bool(last and K_LAST), "gws": gw_detail,
+                              "hit": hit_info,
                               "news": e.get("news", "")}
 
         # price change outlook (FPL's own progress-to-change data, if present)
@@ -1329,6 +1360,9 @@ def explain(proj, *names, gw=None):
     head("Chance of 60+ minutes", [f"{ex[i]['p60']:.0%}" for i in ids])
     head("Expected minutes", [f"{ex[i]['mpg']:.0f}" for i in ids])
     head("Availability", [f"{ex[i]['gws'][gw]['availability']:.0%}" for i in ids])
+    if any(ex[i].get("hit") for i in ids):
+        head("Returned in (G or A)", [f"{h['returned']}/{h['played']} x{h['mult']:.2f}"
+                                      if (h := ex[i].get("hit")) else "-" for i in ids])
     print("-" * (26 + W * len(ids)))
     for k in COMPONENTS:
         vals = [ex[i]["gws"][gw]["components"][k] for i in ids]
@@ -1439,6 +1473,7 @@ def run(cfg=None, data=None, past=None):
             for e in bs["elements"]:
                 if e["id"] in recent:
                     e["recent"] = recent[e["id"]]
+                    e["hit"] = hit_record(recent[e["id"]])
         proj = build_projections(bs, fixtures, cfg, next_gw, past)
 
     df, gws, ts, fx_map, unscheduled = proj

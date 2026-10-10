@@ -87,8 +87,10 @@ class ArchiveSource:
         self.fpl_xp = m.groupby(["element", "GW"])["xP"].sum()   # FPL's own prediction
         self.past = self._last_season()
         # game-by-game minutes & starts (one row per fixture, oldest first)
-        mm = m.sort_values(["GW", "fixture"])[["element", "GW", "minutes", "starts"]]
-        self.games = {pid: (g["GW"].to_numpy(), g["minutes"].to_numpy(), g["starts"].to_numpy())
+        mm = m.sort_values(["GW", "fixture"])
+        mm = mm.assign(ret=((mm["goals_scored"] > 0) | (mm["assists"] > 0)).astype(int))
+        self.games = {pid: (g["GW"].to_numpy(), g["minutes"].to_numpy(), g["starts"].to_numpy(),
+                            g["ret"].to_numpy())
                       for pid, g in mm.groupby("element")}
 
     def _last_season(self):
@@ -150,10 +152,12 @@ class ArchiveSource:
             e["minutes"] = int(e["minutes"])
             e["starts"] = int(e["starts"])
             if pid in self.games:
-                gws_, mins_, st_ = self.games[pid]
+                gws_, mins_, st_, ret_ = self.games[pid]
                 k = int(np.searchsorted(gws_, t))          # games before GW t only
                 e["recent"] = [{"minutes": int(x), "starts": int(y)}
                                for x, y in zip(mins_[max(0, k - 12):k], st_[max(0, k - 12):k])]
+                # the whole season so far, as the live API gives it
+                e["hit"] = (int((mins_[:k] > 0).sum()), int(((mins_[:k] > 0) & (ret_[:k] > 0)).sum()))
             els.append(e)
         teams = self.teams[["id", "name", "short_name", "strength"]].to_dict("records")
         fixtures = []
