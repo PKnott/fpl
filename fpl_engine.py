@@ -124,6 +124,20 @@ DEFAULTS = {
     # line rescale; consistency.py). Raw error rises, because the projections
     # are already too spread out and this widens them. 0 = off.
     "HIT_RATE_WEIGHT": 0.5,
+    # Calibration (calibration.py): projections are over-confident - actual
+    # points run at 0.88x the projected spread next week and 0.72x six weeks
+    # out, because chances of playing are too extreme both ways and far-off
+    # weeks are projected as surely as next week. MINUTES_SHRINK 0.8 (towards
+    # 0.5) with AVAIL_DECAY 0.97 fixes that: slopes 0.98 and 0.95, six-week
+    # error -3.7% in every season. But it does not make better decisions: in
+    # full-season backtests it averaged -5 pts/season at the best wildcard bar
+    # (bars 14-20 tried), and -49 pts/season with a 4-point hit cost.
+    # The planner's hit cost of 6 and wildcard bar of 20 were tuned with these
+    # inflated numbers and balance them. Off (1.0) until those are retuned
+    # together.
+    "MINUTES_SHRINK": 1.0,
+    "MINUTES_SHRINK_TO": 0.5,
+    "AVAIL_DECAY": 1.0,
     "HIT_RATE_BASE": {2: 0.08, 3: 0.17, 4: 0.25},   # position averages, archive
     "HIT_MIN_GAMES": 3,
     # Goalkeepers get their own steadying (saves & bonus are very noisy).
@@ -429,6 +443,9 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
     hit_w = cfg.get("HIT_RATE_WEIGHT", 0) or 0
     hit_base = {int(k): v for k, v in (cfg.get("HIT_RATE_BASE") or {}).items()}
     hit_min = cfg.get("HIT_MIN_GAMES", 3)
+    shrink = cfg.get("MINUTES_SHRINK", 1.0)
+    shrink_to = cfg.get("MINUTES_SHRINK_TO", 0.5)
+    avail_decay = cfg.get("AVAIL_DECAY", 1.0)
     m_decay = cfg.get("MINUTES_DECAY")
     rows, breakdown = [], {}
     for e in bs["elements"]:
@@ -485,6 +502,12 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
             p_any = start_rate + min(max(0.0, sub_mins / 20), 1 - start_rate)
             p60 = start_rate * 0.92
             minutes_method = "season"
+        # Nobody is certain to play, and squad players play more than their recent
+        # minutes say: pull the chances towards MINUTES_SHRINK_TO. 1 = off.
+        if shrink < 1:
+            start_rate = shrink * start_rate + (1 - shrink) * shrink_to
+            p60 = shrink * p60 + (1 - shrink) * shrink_to * 0.92
+            p_any = shrink * p_any + (1 - shrink) * shrink_to
         if norm(e["web_name"]) in start_ov:
             start_rate = start_ov[norm(e["web_name"])]
             mpg = start_rate * 85
@@ -507,6 +530,7 @@ def build_projections(bs, fixtures, cfg, next_gw, past=None):
         xp, gw_detail = {}, {}
         for i, gw in enumerate(gws):
             av = 0.0 if status == "u" else base_av + (1 - base_av) * min(1.0, i / 3)
+            av *= avail_decay ** i          # weeks further out carry more risk
             av = ov.get(gw, ov.get(str(gw), av))
             comp = dict.fromkeys(COMPONENTS, 0.0)
             fixtures_info = []

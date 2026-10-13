@@ -48,10 +48,21 @@ def base_cfg(**over):
         over)
 
 
-def projector_for(season):
-    """Projections don't depend on chip rules, so every command shares one cache."""
-    cfg = base_cfg()
+def projector_for(season, **over):
+    """Projections don't depend on chip rules, so every command shares one cache
+    (one per set of projection overrides)."""
+    cfg = base_cfg(**over)
     return B.Projector(B.ArchiveSource(season), cfg, cfg["PROJECTION_WEEKS"])
+
+
+# Starting squads are picked from these projections in every command, so runs
+# from different engine versions start from the same 15 squads and compare
+# pair by pair. (These are the projections the first recordings used.)
+SQUAD_PROJECTION = {"MINUTES_SHRINK": 1.0, "AVAIL_DECAY": 1.0}
+
+
+def fixed_squads(season, cfg, n):
+    return B.starting_squads(projector_for(season, **SQUAD_PROJECTION), cfg, n=n)
 
 
 def record_one(args):
@@ -63,7 +74,7 @@ def record_one(args):
     if out.exists():
         return f"{season} squad {squad_ix}: already recorded, skipping"
     projector = projector_for(season)
-    squads = B.starting_squads(projector, cfg, n=8)
+    squads = fixed_squads(season, cfg, 8)
     t0 = time.time()
     r = B.simulate(projector, cfg, f"{season}/sq{squad_ix}",
                    start=list(squads[squad_ix]), last_gw=last_gw, record_chips=True)
@@ -83,6 +94,7 @@ def cmd_record(a):
         # and several of them writing the same pickle at once would corrupt it.
         t0 = time.time()
         projector_for(s)
+        projector_for(s, **SQUAD_PROJECTION)
         print(f"{s}: projections ready ({time.time() - t0:.0f}s)", flush=True)
     jobs = [(s, i, a.gw) for s in seasons for i in range(a.squads)]
     print(f"{len(jobs)} record runs across {a.workers} workers\n")
@@ -106,7 +118,7 @@ def wildcard_one(args):
     # only the simulation sees the forced week.
     rec_cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"])
     projector = projector_for(season)
-    start = B.starting_squads(projector, rec_cfg, n=1)[0]
+    start = fixed_squads(season, rec_cfg, 1)[0]
     cfg = dict(rec_cfg, FORCE_WILDCARD={stop: gw})
     t0 = time.time()
     r = B.simulate(projector, cfg, f"{season}/wc{gw}", start=list(start))
@@ -122,6 +134,7 @@ def cmd_wildcard(a):
     for s in seasons:
         B.download(s)
         projector_for(s)
+        projector_for(s, **SQUAD_PROJECTION)
         print(f"{s}: projections ready", flush=True)
     jobs = [(s, stop, gw) for s in seasons for stop, weeks in WILDCARD_WEEKS.items()
             for gw in weeks]
@@ -209,14 +222,14 @@ POLICY_DIR = ROOT / "bt_cache" / "policy"
 
 
 def policy_one(args):
-    season, label, over, squad_ix = args
+    season, label, over, squad_ix, extra = args
     sq = f"_sq{squad_ix}" if squad_ix else ""     # squad 0 keeps its original name
     out = POLICY_DIR / f"{season}_{label}{sq}.json"
     if out.exists():
         return f"{season} {label}: already run, skipping"
-    cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"], **over)
-    projector = projector_for(season)
-    start = B.starting_squads(projector, cfg, n=squad_ix + 1)[squad_ix]
+    cfg = base_cfg(PLAYABLE_CHIPS=["wildcard"], **extra, **over)
+    projector = projector_for(season, **extra)
+    start = fixed_squads(season, cfg, squad_ix + 1)[squad_ix]
     t0 = time.time()
     r = B.simulate(projector, cfg, f"{season}/{label}{sq}", start=list(start))
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -230,9 +243,13 @@ def cmd_policy(a):
     """Full seasons under each wildcard rule: the rank rule at several shares, and
     the gap rule at several bars."""
     seasons = a.seasons.split(",") if a.seasons else SEASONS
+    extra = json.loads(a.set) if a.set else {}
     for s in seasons:
         B.download(s)
         projector_for(s)
+        projector_for(s, **SQUAD_PROJECTION)
+        if extra:
+            projector_for(s, **extra)     # built serially so workers share it
     pct = E.DEFAULTS["CHIP_TOP_PCT"]
     # WILDCARD_GAP=None, or the default bar would override the rank rule
     ranks = [float(v) for v in a.ranks.split(",") if v]
@@ -244,7 +261,7 @@ def cmd_policy(a):
                 for x in ranks]
     policies += [(f"gap{g:g}{tag}", {"WILDCARD_GAP": g}) for g in gaps]
     squads = [int(v) for v in a.squads.split(",")]
-    jobs = [(s, label, over, q) for s in seasons for q in squads for label, over in policies]
+    jobs = [(s, label, over, q, extra) for s in seasons for q in squads for label, over in policies]
     print(f"{len(jobs)} full-season runs across {a.workers} workers\n", flush=True)
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
         for msg in ex.map(policy_one, jobs):
@@ -342,6 +359,7 @@ if __name__ == "__main__":
     pol.add_argument("--gaps", default="5,10,15,20")
     pol.add_argument("--squads", default="0", help="starting squads, e.g. 0,1,2,3,4")
     pol.add_argument("--tag", default="", help="suffix for this engine version's results")
+    pol.add_argument("--set", default="", help='settings to override, as JSON, e.g. \'{"AVAIL_DECAY": 0.97}\'')
     pol.add_argument("--workers", type=int, default=os.cpu_count())
     pol.set_defaults(func=cmd_policy)
     w = sub.add_parser("wildcard")

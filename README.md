@@ -304,6 +304,43 @@ noisily: +48 in the one season where the wildcard weeks didn't move, and −11 a
 +9 in the two where the change also shifted the second wildcard. It's on, as a
 modest and likely improvement rather than a proven one.
 
+### Calibration: more accurate isn't always better
+
+`calibration.py` splits every projection into its parts and checks each against
+what happened. The projections are **over-confident**, and more so the further
+ahead they look:
+
+| Weeks ahead | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| Slope of actual on projected (1.00 = calibrated) | 0.88 | 0.82 | 0.78 | 0.76 | 0.74 | 0.72 |
+
+Playing time is the biggest source (61% of projected points, slope 0.86; 0.78
+for players the engine is sure will play): the chances of playing are too
+extreme both ways, and week 6 is projected as surely as next week. Pulling the
+chances 20% towards 50% and making each further week 0.97× as certain
+(`MINUTES_SHRINK`, `AVAIL_DECAY`) fixes it: slopes 0.98 and 0.95, and six-week
+error falls 3.7% in every season — the largest accuracy gain of anything tried.
+
+**It doesn't make better decisions**, so it's off. Full seasons against the
+current engine (mean difference per season, 3 seasons × 5 squads):
+
+| Calibrated, with | 2023-24 | 2024-25 | 2025-26 | Mean |
+|---|---|---|---|---|
+| Wildcard bar 14 | −24 | +8 | −64 | −27 |
+| Wildcard bar 16 | −26 | +8 | −52 | −23 |
+| Wildcard bar 18 | −14 | +8 | −10 | −5 |
+| Wildcard bar 20 | +5 | +8 | −28 | −5 |
+| Bar 20, FPL's real 4-point hit cost | −16 | −61 | −69 | **−49** |
+
+Calibration barely changes *who* gets picked (rankings move by 0.003); it
+changes how big gains look. The planner's 6-point hit cost and the wildcard bar
+of 20 were tuned with the inflated numbers and balance them. Lowering the bar
+to match the smaller gaps brings back early second wildcards, and charging the
+real 4 points for a hit makes the planner take too many. The clean signal is
+2024-25, where the wildcard weeks didn't move: +8 with the 6-point hit cost.
+Making calibration pay would mean retuning the hit cost, the bar and the chip
+thresholds together.
+
 ### Season totals
 
 With no chips at all, the engine scores 2,249–2,302 (2023-24), 2,342–2,400
@@ -328,9 +365,9 @@ showed on its own:
   wildcard and "later" always looks best for a Bench Boost. That is why the
   wildcard moved to a gap rule and the Bench Boost to a looser threshold.
 - **The projections are over-confident.** Over six weeks, actual points ≈ 3.6 +
-  0.70 × projected: big projections overshoot and small ones undershoot. Rankings
-  are unaffected, but the size of any gain (a hit, a chip, a captain margin) is
-  overstated. This is the next thing to fix.
+  0.70 × projected. A fix that calibrates them exists, but the decision rules were
+  tuned around the inflated numbers, so on its own it scores slightly worse
+  ([details](#calibration-more-accurate-isnt-always-better)).
 - **A planner that didn't know a wildcard was coming** took four hits the week
   before a forced rebuild. Forced weeks are now planned in advance.
 
@@ -401,6 +438,8 @@ PuLP is pinned because 4.0 no longer includes the CBC solver.
 .venv/bin/python run_backtest.py gaps                            # wildcard gap by stage of season
 .venv/bin/python run_backtest.py wildcard --workers 4            # forced-week experiment
 .venv/bin/python run_backtest.py policy --gaps 15,20,25,30       # wildcard rule comparison
+.venv/bin/python run_backtest.py policy --gaps 20 --squads 0,1,2,3,4 --tag cal \
+    --set '{"MINUTES_SHRINK": 0.8, "AVAIL_DECAY": 0.97}'          # any setting, paired by squad
 ```
 
 **Analysis:**
@@ -410,6 +449,8 @@ PuLP is pinned because 4.0 no longer includes the CBC solver.
 .venv/bin/python projection_accuracy.py   # projected vs actual points, per config
 .venv/bin/python consistency.py           # one big game vs consistent returns; finishing skill
 .venv/bin/python consistency.py engine    # does consistency add to the engine's projections?
+.venv/bin/python calibration.py           # which parts of the projection are over-confident
+.venv/bin/python calibration.py grid      # candidate calibration fixes, scored the same way
 ```
 
 **Verification:**
@@ -428,6 +469,7 @@ run_backtest.py             command-line tool: record, tune and the wildcard exp
 signal_noise.py             when a player's form becomes signal, per stat
 projection_accuracy.py      projected vs actual points for competing configs
 consistency.py              consistent performers vs one big game; is finishing a skill
+calibration.py              how over-confident the projections are, and where
 FPL_Weekly_Assistant.ipynb  the weekly report
 FPL_Backtest.ipynb          backtest and tuning walkthrough
 verify.py                   regression check against frozen reference outputs
