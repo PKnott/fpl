@@ -18,6 +18,7 @@ per-player breakdown, so two sets of projections can be alive at once (the
 backtest holds all 38 gameweeks simultaneously).
 """
 import math
+import time
 import subprocess
 import sys
 import unicodedata
@@ -227,10 +228,18 @@ def resolve_cfg(*overrides, **kw):
 # ---------------------------------------------------------------------
 # 2. HELPERS
 # ---------------------------------------------------------------------
-def fetch(path):
-    r = requests.get(API + path, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def fetch(path, tries=4):
+    """GET from the FPL API, retrying with back-off: it rate-limits bursts of
+    requests, and a silently missing player history skews his projection."""
+    for attempt in range(tries):
+        try:
+            r = requests.get(API + path, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError):
+            if attempt == tries - 1:
+                raise
+            time.sleep(1.5 * 2 ** attempt)
 
 
 def norm(s):
@@ -344,10 +353,18 @@ def fetch_player_pages(ids):
             return pid, (past[-1] if past else None), recent
         except Exception:
             return pid, None, None
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         res = list(ex.map(one, ids))
     past = {pid: s for pid, s, _ in res if s and s.get("minutes", 0) >= 600}
     recent = {pid: r for pid, _, r in res if r}
+    failed = [pid for pid, _, r in res if r is None]
+    if failed:
+        # Without a history a player loses last season, his recent minutes and
+        # his consistency record, so his projection is thinner than everyone's.
+        # Say so rather than let it quietly change the advice.
+        print(f"WARNING: no history for {len(failed)} player(s) after retries "
+              f"(ids {failed[:10]}{'...' if len(failed) > 10 else ''}) - "
+              "their projections are less reliable; re-run if any are in your plans.")
     return past, recent
 
 
