@@ -282,7 +282,11 @@ def team_strength(bs, fixtures, cfg):
     gf = {t: 0 for t in teams}
     ga = {t: 0 for t in teams}
     for fx in fixtures:
-        if fx.get("finished") and fx.get("team_h_score") is not None:
+        # "finished" waits for bonus to be confirmed, a day or two after the
+        # game; player histories already include it, so count provisional
+        # results too or teams and players disagree on how many games exist.
+        if (fx.get("finished") or fx.get("finished_provisional")) \
+                and fx.get("team_h_score") is not None:
             h, a = fx["team_h"], fx["team_a"]
             played[h] += 1; played[a] += 1
             gf[h] += fx["team_h_score"]; ga[h] += fx["team_a_score"]
