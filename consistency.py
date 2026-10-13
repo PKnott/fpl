@@ -33,6 +33,8 @@ Two questions, both answered from the archive, game by game:
 
     python consistency.py            # parts 1 and 2 (seconds)
     python consistency.py engine     # part 3 (builds projections, ~1 min)
+    python consistency.py returns    # part 4: count clean sheets / defensive
+                                     # contributions as returns? (~1 min)
 """
 import os
 import pathlib
@@ -58,8 +60,11 @@ def load(season):
     p = pd.read_csv(DATA / f"{season}_players_raw.csv").set_index("id")
     m["code"] = m["element"].map(p["code"])
     m["season"] = season
+    if "defensive_contribution" not in m:          # only exists from 2025-26
+        m["defensive_contribution"] = 0
     keep = ["season", "element", "code", "position", "GW", "fixture", "minutes",
-            "goals_scored", "assists", "expected_goals", "expected_assists", "total_points"]
+            "goals_scored", "assists", "expected_goals", "expected_assists", "total_points",
+            "clean_sheets", "defensive_contribution"]
     m = m[keep].copy()
     for k in ("expected_goals", "expected_assists"):
         m[k] = pd.to_numeric(m[k], errors="coerce").fillna(0.0)
@@ -211,18 +216,19 @@ def part_finishing(all_games):
 # 3. On top of the engine
 # ---------------------------------------------------------------------
 ENGINE_SEASONS = ["2023-24", "2024-25", "2025-26"]    # 2022-23 has no fixtures file
+E_DC = {2: 10, 3: 12, 4: 12}    # defensive contributions needed for the 2 points
 AHEAD = 6
 HIT_PRIOR_GAMES = 5
 
 
-def engine_rows():
+def engine_rows(over=None):
     os.environ.setdefault("BT_DATA", str(ROOT / "bt_data"))
     os.environ.setdefault("BT_CACHE", str(ROOT / "bt_cache"))
     sys.path.insert(0, str(ROOT))
     import run_backtest as R
     rows = []
     for season in ENGINE_SEASONS:
-        pj = R.projector_for(season)
+        pj = R.projector_for(season, **(over or {}))
         src = pj.source
         games = load(season)
         by_el = {el: g.sort_values(["GW", "fixture"]) for el, g in games.groupby("element")}
@@ -241,7 +247,10 @@ def engine_rows():
                     continue
                 ws = [w for w in range(t, min(t + AHEAD, 39)) if f"gw{w}" in df.columns]
                 acts = [src.actual.get((i, w)) for w in ws]
-                hit = ((b["goals_scored"] > 0) | (b["assists"] > 0)).mean()
+                ga = (b["goals_scored"] > 0) | (b["assists"] > 0)
+                cs = b["clean_sheets"] > 0
+                dc = b["defensive_contribution"] >= E_DC.get(int(row["pos"]), 99)
+                hit = ga.mean()
                 n_games = len(b)
                 mins = b["minutes"].sum()
                 rows.append({
@@ -250,6 +259,8 @@ def engine_rows():
                     "proj6": sum(row[f"gw{w}"] for w in ws) if len(ws) == AHEAD else np.nan,
                     "act6": float(sum(acts)) if len(ws) == AHEAD and all(a is not None for a in acts) else np.nan,
                     "hit": hit, "n": n_games,
+                    "r_ga": ga.mean(), "r_ga_cs": (ga | cs).mean(), "r_ga_dc": (ga | dc).mean(),
+                    "r_ga_cs_dc": (ga | cs | dc).mean(),
                     "over_a90": (b["assists"].sum() - b["expected_assists"].sum()) / mins * 90,
                 })
     return pd.DataFrame(rows)
@@ -310,7 +321,74 @@ def part_engine():
         print()
 
 
+# ---------------------------------------------------------------------
+# 4. What counts as a return?
+# ---------------------------------------------------------------------
+RETURN_DEFS = {
+    "G/A (current)":         {2: "r_ga", 3: "r_ga", 4: "r_ga"},
+    "+ CS for DEF":          {2: "r_ga_cs", 3: "r_ga", 4: "r_ga"},
+    "+ CS for DEF & MID":    {2: "r_ga_cs", 3: "r_ga_cs", 4: "r_ga"},
+    "+ DC for DEF & MID":    {2: "r_ga_dc", 3: "r_ga_dc", 4: "r_ga"},
+    "+ CS & DC for DEF & MID": {2: "r_ga_cs_dc", 3: "r_ga_cs_dc", 4: "r_ga"},
+}
+
+
+def scaled(d, spec, weight=0.5):
+    """The six-week projection with the engine's consistency multiplier, for a
+    given definition of a return."""
+    if spec is None:
+        return d["proj6"].to_numpy()
+    rate = np.select([d["pos"] == p_ for p_ in spec], [d[spec[p_]] for p_ in spec])
+    base = d.assign(rate=rate).groupby("pos")["rate"].transform("mean").to_numpy()
+    mult = np.clip(1 + weight * (rate - base), 0.75, 1.35)
+    return d["proj6"].to_numpy() * mult
+
+
+def rescaled(d, pred):
+    """Held-out RMSE after a straight-line fit on the other seasons, and corr."""
+    y, se = d["act6"].to_numpy(), 0.0
+    seasons = d["season"].unique()
+    for s_ in seasons:
+        te = (d["season"] == s_).to_numpy()
+        if len(seasons) > 1:
+            b, a = np.polyfit(pred[~te], y[~te], 1)
+        else:
+            b, a = np.polyfit(pred, y, 1)
+        se += ((a + b * pred[te] - y[te]) ** 2).sum()
+    return np.sqrt(se / len(d)), np.corrcoef(pred, y)[0, 1]
+
+
+def part_returns():
+    print("4. WHAT COUNTS AS A RETURN? Projections without any consistency "
+          "adjustment, then each definition applied the way the engine applies it.",
+          end="\n\n")
+    d = engine_rows({"HIT_RATE_WEIGHT": 0}).dropna(subset=["proj6", "act6"])
+    defs = {"no adjustment": None, **RETURN_DEFS}
+    for title, sub in (("All outfield, 3 seasons", d),
+                       ("Defenders only, 3 seasons", d[d["pos"] == 2]),
+                       ("Midfielders only, 3 seasons", d[d["pos"] == 3]),
+                       ("All outfield, 2025-26 only (the one season with DC data)",
+                        d[d["season"] == "2025-26"])):
+        print(f"  {title}   ({len(sub)} player-weeks)")
+        base = None
+        for name, spec in defs.items():
+            r, c = rescaled(sub, scaled(sub, spec))
+            base = base or r
+            per = ""
+            if sub["season"].nunique() > 1:
+                cells = []
+                for s_ in ENGINE_SEASONS:
+                    x = sub[sub["season"] == s_]
+                    cells.append(f"{s_[-5:]} {np.corrcoef(scaled(x, spec), x['act6'])[0, 1]:.3f}")
+                per = "   corr by season: " + " ".join(cells)
+            print(f"    {name:<26} RMSE {r:.4f} ({(r / base - 1) * 100:+.2f}%)  corr {c:.4f}{per}")
+        print()
+
+
 def main():
+    if sys.argv[1:] == ["returns"]:
+        part_returns()
+        return
     if sys.argv[1:] == ["engine"]:
         part_engine()
         return
